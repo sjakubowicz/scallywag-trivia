@@ -1,2 +1,0 @@
-# scallywag-trivia
-Trivia Game
