@@ -1,4 +1,4 @@
-const VERSION = "v1.0.2";
+const VERSION = "v1.0.4";
 const CACHE   = "scallywag-" + VERSION;
 
 self.addEventListener("install", e => {
@@ -24,5 +24,39 @@ self.addEventListener("fetch", e => {
       }
       return res;
     }).catch(() => caches.match(e.request).then(cached => cached || caches.match("./index.html")))
+  );
+});
+
+// ── Push notification handler ──────────────────────────────────────────────
+self.addEventListener("push", e => {
+  const data = e.data ? e.data.json() : {};
+  const title   = data.notification?.title || "ScAllywag Trivia ⚓";
+  const options = {
+    body:    data.notification?.body  || "New questions are ready! Set sail! 🏴‍☠️",
+    icon:    "./icons/icon-192.png",
+    badge:   "./icons/icon-192.png",
+    vibrate: [200, 100, 200],
+    data:    { url: data.data?.url || "./" },
+    actions: [
+      { action: "play", title: "Play Now 🎯" },
+      { action: "dismiss", title: "Later" }
+    ]
+  };
+  e.waitUntil(self.registration.showNotification(title, options));
+});
+
+// ── Notification click handler ─────────────────────────────────────────────
+self.addEventListener("notificationclick", e => {
+  e.notification.close();
+  if (e.action === "dismiss") return;
+  e.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then(clientList => {
+      if (clientList.length > 0) {
+        clientList[0].focus();
+        clientList[0].navigate(e.notification.data?.url || "./");
+      } else {
+        clients.openWindow(e.notification.data?.url || "./");
+      }
+    })
   );
 });
