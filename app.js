@@ -70,6 +70,9 @@ function getDB() {
     if (typeof firebase === "undefined") return null;
     if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
     _db = firebase.database();
+    try {
+      _db.ref(".info/connected").on("value", s => { _connected = s.val() === true; emitSync(); if (_connected) flushOutbox(); });
+    } catch {}
     return _db;
   } catch(e) {
     console.warn("Firebase init error:", e.message);
@@ -82,7 +85,10 @@ async function sget(key) {
   const db = getDB();
   if (db) {
     try {
-      const snap = await db.ref("scallywag/" + key).once("value");
+      const snap = await Promise.race([
+        db.ref("scallywag/" + key).once("value"),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000)),
+      ]);
       const val = snap.val();
       _cache[key] = val;
       try { localStorage.setItem("sg_shared_" + key, JSON.stringify(val)); } catch {}
@@ -106,7 +112,10 @@ async function sset(key, val) {
   const db = getDB();
   if (db) {
     try {
-      await db.ref("scallywag/" + key).set(val);
+      await Promise.race([
+        db.ref("scallywag/" + key).set(val),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+      ]);
     } catch(e) {
       console.warn("Firebase write failed for", key, e.message);
     }
@@ -121,6 +130,262 @@ function pset(key, val) {
   try { localStorage.setItem("sg_user_" + key, JSON.stringify(val)); } catch {}
 }
 function invalidate(key) { delete _cache[key]; }
+
+// ── Reliable writes ───────────────────────────────────────────────────────────
+// Every score / answer / attempt / daily-log write is (1) shown on screen instantly,
+// (2) saved in an outbox on this device, and (3) sent to Firebase as an ATOMIC update
+// of just that one entry. If the signal drops, the outbox waits and retries with
+// back-off, even after the app is closed and reopened. Entries carry ids so a retry
+// can never double-count, and two players answering at the same instant can no longer
+// overwrite each other (the old code rewrote the whole scores object from one phone).
+const OUTBOX_KEY = "sg_outbox_v1";
+const FAILED_KEY = "sg_outbox_failed_v1";
+const newId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const toArr = v => Array.isArray(v) ? v.filter(x => x !== null && x !== undefined)
+                 : (v && typeof v === "object" ? Object.values(v) : []);
+const cleanName = s => String(s || "").replace(/[.#$\/\[\]|]/g, "").replace(/\s+/g, " ").trim();
+function mirror(key, val) { _cache[key] = val; try { localStorage.setItem("sg_shared_" + key, JSON.stringify(val)); } catch {} }
+function outboxLoad() { try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]"); } catch { return []; } }
+function outboxSave(q) { try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(q)); } catch {} }
+const _syncSubs = new Set();
+function onSyncChange(fn) { _syncSubs.add(fn); return () => { _syncSubs.delete(fn); }; }
+function emitSync() { const n = outboxLoad().length; _syncSubs.forEach(f => { try { f(n); } catch {} }); }
+let _connected = true, _flushPromise = null, _retryTimer = null, _retryDelay = 2000;
+
+function withTimeout(p, ms) { return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]); }
+function txn(db, path, fn) {
+  return withTimeout(db.ref(path).transaction(fn, undefined, false), 12000)
+    .then(r => { if (r && r.committed === false) throw new Error("transaction aborted"); return r; });
+}
+function setAt(db, path, val) { return withTimeout(db.ref(path).set(val), 12000); }
+
+async function applyOp(db, op) {
+  const P = "scallywag/";
+  const sameScore = (x, e2) => x && (x.id === e2.id || (x.ts === e2.ts && x.pts === e2.pts));
+  switch (op.type) {
+    case "score":
+      return txn(db, P + "scores/" + op.user, cur => { const a = toArr(cur); return a.some(x => sameScore(x, op.entry)) ? a : [...a, op.entry]; });
+    case "weekWipe":
+      return txn(db, P + "scores/" + op.user, cur => { const a = toArr(cur).filter(x => weekStr(x.ts) !== op.week); return a.length ? a : null; });
+    case "answered":
+      return txn(db, P + "answered/" + op.qid, cur => { const a = toArr(cur); return a.includes(op.user) ? a : [...a, op.user]; });
+    case "attempt":
+      return txn(db, P + "attempts/" + op.qid, cur => { const a = toArr(cur); return a.some(x => x && x.id === op.entry.id) ? a : [...a, op.entry]; });
+    case "attemptFix":
+      return txn(db, P + "attempts/" + op.qid, cur => toArr(cur).map(x => x.user === op.user && x.ts === op.ts && !x.correct ? { ...x, correct: true, accepted: true } : x));
+    case "daily":
+      return txn(db, P + "daily_log/" + op.key, cur => { const a = toArr(cur); return a.includes(op.qid) ? a : [...a, op.qid]; });
+    case "bonusUse":
+      return txn(db, P + "bonuses/" + op.user, cur => { const n = (typeof cur === "number" ? cur : 0) - 1; return n > 0 ? n : null; });
+    case "notice":
+      return txn(db, P + "notices/" + op.user, cur => { const a = toArr(cur); return a.some(x => (x.id || x.qid) === op.notice.id) ? a : [...a, op.notice]; });
+    case "noticeDismiss":
+      return txn(db, P + "notices/" + op.user, cur => { const a = toArr(cur).filter(x => (x.id || x.qid) !== op.nid); return a.length ? a : null; });
+    case "addQuestion":
+      return txn(db, P + "questions", cur => { const a = toArr(cur); return a.some(x => x.id === op.q.id) ? a : [...a, op.q]; });
+    case "alt":
+      return txn(db, P + "questions", cur => toArr(cur).map(q => q.id === op.qid ? { ...q, alts: [...new Set([...toArr(q.alts), op.alt])] } : q));
+    case "appeal":
+      return setAt(db, P + "appeals/" + op.appeal.id, op.appeal);
+    case "appealStatus":
+      return setAt(db, P + "appeals/" + op.id + "/status", op.status);
+    default:
+      return;
+  }
+}
+
+function scheduleRetry() {
+  if (_retryTimer) return;
+  _retryTimer = setTimeout(() => { _retryTimer = null; flushOutbox(); }, _retryDelay);
+  _retryDelay = Math.min(_retryDelay * 2, 60000);
+}
+
+function flushOutbox() {
+  if (_flushPromise) return _flushPromise;
+  _flushPromise = (async () => {
+    const db = getDB();
+    const online = typeof navigator === "undefined" || navigator.onLine !== false;
+    if (!db || !_connected || !online) { if (outboxLoad().length) scheduleRetry(); return; }
+    let q = outboxLoad();
+    while (q.length) {
+      const op = q[0];
+      try {
+        await applyOp(db, op);
+        outboxSave(outboxLoad().filter(x => x.opId !== op.opId));
+        emitSync(); _retryDelay = 2000;
+      } catch (err) {
+        const tries = (op.tries || 0) + 1;
+        const permanent = /permission|invalid|disallowed|not allowed/i.test(String((err && (err.code || err.message)) || ""));
+        if (permanent && tries >= 3) {
+          // A write the database will never accept — park it so it can't block everything behind it
+          try { const f = JSON.parse(localStorage.getItem(FAILED_KEY) || "[]"); f.push({ ...op, error: String(err && err.message) }); localStorage.setItem(FAILED_KEY, JSON.stringify(f.slice(-50))); } catch {}
+          outboxSave(outboxLoad().filter(x => x.opId !== op.opId)); emitSync();
+        } else {
+          outboxSave(outboxLoad().map(x => x.opId === op.opId ? { ...x, tries } : x));
+          scheduleRetry();
+          return;
+        }
+      }
+      q = outboxLoad();
+    }
+  })().finally(() => { _flushPromise = null; });
+  return _flushPromise;
+}
+
+function enqueueOp(op) {
+  const q = outboxLoad();
+  q.push({ ...op, opId: newId(), tries: 0 });
+  outboxSave(q); emitSync(); flushOutbox();
+}
+
+// Re-apply not-yet-sent writes on top of data loaded from Firebase, so the screen never
+// "forgets" an answer that is still waiting in the outbox.
+function overlay(key, val) {
+  const ops = outboxLoad();
+  if (!ops.length) return val;
+  let v = val;
+  const sameScore = (x, e2) => x && (x.id === e2.id || (x.ts === e2.ts && x.pts === e2.pts));
+  for (const op of ops) {
+    if (key === KEYS.scores && op.type === "score") { v = { ...(v || {}) }; const a = toArr(v[op.user]); if (!a.some(x => sameScore(x, op.entry))) v[op.user] = [...a, op.entry]; }
+    else if (key === KEYS.scores && op.type === "weekWipe") { v = { ...(v || {}) }; if (v[op.user]) v[op.user] = toArr(v[op.user]).filter(x => weekStr(x.ts) !== op.week); }
+    else if (key === KEYS.answered && op.type === "answered") { v = { ...(v || {}) }; const a = toArr(v[op.qid]); if (!a.includes(op.user)) v[op.qid] = [...a, op.user]; }
+    else if (key === KEYS.attempts && op.type === "attempt") { v = { ...(v || {}) }; const a = toArr(v[op.qid]); if (!a.some(x => x.id === op.entry.id)) v[op.qid] = [...a, op.entry]; }
+    else if (key === KEYS.attempts && op.type === "attemptFix") { v = { ...(v || {}) }; v[op.qid] = toArr(v[op.qid]).map(x => x.user === op.user && x.ts === op.ts && !x.correct ? { ...x, correct: true, accepted: true } : x); }
+    else if (key === KEYS.dailyLog && op.type === "daily") { v = { ...(v || {}) }; const a = toArr(v[op.key]); if (!a.includes(op.qid)) v[op.key] = [...a, op.qid]; }
+    else if (key === KEYS.bonuses && op.type === "bonusUse") { v = { ...(v || {}) }; const n = (v[op.user] || 0) - 1; if (n > 0) v[op.user] = n; else delete v[op.user]; }
+    else if (key === KEYS.notices && op.type === "notice") { v = { ...(v || {}) }; const a = toArr(v[op.user]); if (!a.some(x => (x.id || x.qid) === op.notice.id)) v[op.user] = [...a, op.notice]; }
+    else if (key === KEYS.notices && op.type === "noticeDismiss") { v = { ...(v || {}) }; v[op.user] = toArr(v[op.user]).filter(x => (x.id || x.qid) !== op.nid); }
+    else if (key === KEYS.questions && op.type === "addQuestion") { v = toArr(v); if (!v.some(x => x.id === op.q.id)) v = [...v, op.q]; }
+    else if (key === KEYS.questions && op.type === "alt") { v = toArr(v).map(q => q.id === op.qid ? { ...q, alts: [...new Set([...toArr(q.alts), op.alt])] } : q); }
+    else if (key === KEYS.appeals && op.type === "appeal") { v = { ...(v || {}), [op.appeal.id]: op.appeal }; }
+    else if (key === KEYS.appeals && op.type === "appealStatus") { if (v && v[op.id]) v = { ...v, [op.id]: { ...v[op.id], status: op.status } }; }
+  }
+  return v;
+}
+
+
+// ── Changing a name without losing anything ──────────────────────────────────
+// A player's name is the key their data lives under (scores, bonuses, notices, daily log)
+// and is written inside their answers, attempts, flags, questions, appeals and plank
+// record. Renaming must move ALL of it. Every step below is safe to run twice, so if the
+// signal drops half-way the rename simply resumes (see RENAME_KEY) and nothing is lost.
+const RENAME_KEY = "sg_rename_v1";
+const normName = s => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+function readNode(db, path) { return withTimeout(db.ref("scallywag/" + path).once("value"), 15000).then(s => s.val()); }
+
+// Returns a message if the name can't be used, otherwise null
+async function nameIsTaken(db, from, to) {
+  const n = normName(to);
+  if (!n) return "Pick a name first, matey.";
+  if (n === "trivia bot") return "That name is reserved for the ship's own bot.";
+  const [scores, bonuses, notices, attempts, questions, appeals, captains, plankHist] = await Promise.all(
+    ["scores", "bonuses", "notices", "attempts", "questions", "appeals", "captains", "plank_history"].map(k => readNode(db, k)));
+  const names = new Set([...Object.keys(scores || {}), ...Object.keys(bonuses || {}), ...Object.keys(notices || {}), ...toArr(captains)]);
+  Object.values(attempts || {}).forEach(list => toArr(list).forEach(a => { if (a && a.user) names.add(a.user); }));
+  toArr(questions).forEach(q => { if (q && q.author) names.add(q.author); });
+  Object.values(appeals || {}).forEach(a => { if (a && a.user) names.add(a.user); });
+  toArr(plankHist).forEach(h => { if (h && h.victim) names.add(h.victim); });
+  for (const nm of names) {
+    if (nm !== from && normName(nm) === n) return `"${nm}" is already sailing with this crew. Pick another name, matey.`;
+  }
+  return null;
+}
+
+
+// Everyone who has played, with a few stats (used by the sign-in screen)
+async function loadRoster(db) {
+  const [scores, attempts, questions, bonuses, notices, appeals] = await Promise.all(
+    ["scores", "attempts", "questions", "bonuses", "notices", "appeals"].map(k => readNode(db, k)));
+  const info = {};
+  const touch = n => { if (!n || n === "Trivia Bot") return null; return info[n] || (info[n] = { gold: 0, answered: 0, correct: 0, authored: 0 }); };
+  Object.entries(scores || {}).forEach(([n, list]) => { const o = touch(n); if (o) toArr(list).forEach(x => { o.gold += (x && x.pts) || 0; }); });
+  Object.values(attempts || {}).forEach(list => toArr(list).forEach(a => { const o = a && touch(a.user); if (o) { o.answered++; if (a.correct) o.correct++; } }));
+  toArr(questions).forEach(q => { const o = q && touch(q.author); if (o) o.authored++; });
+  Object.keys(bonuses || {}).forEach(touch); Object.keys(notices || {}).forEach(touch);
+  Object.values(appeals || {}).forEach(a => { if (a) touch(a.user); });
+  return info;
+}
+
+async function migrateName(db, from, to, progress = () => {}) {
+  const P = "scallywag/";
+  const mapU = u => (u === from ? to : u);
+  const union = (a, b, same) => { const out = [...a]; b.forEach(x => { if (!out.some(y => same(y, x))) out.push(x); }); return out; };
+
+  progress("Moving yer gold…");
+  const oldScores = toArr(await readNode(db, "scores/" + from));
+  if (oldScores.length) {
+    await txn(db, P + "scores/" + to, cur => union(toArr(cur), oldScores, (y, x) => (y.id && x.id) ? y.id === x.id : (y.ts === x.ts && y.pts === x.pts)));
+    await setAt(db, P + "scores/" + from, null);
+  }
+  const oldBonus = await readNode(db, "bonuses/" + from);
+  if (typeof oldBonus === "number" && oldBonus > 0) {
+    // One atomic multi-path update: the bonus moves in a single step, so a retry can never double it
+    const curTo = await readNode(db, "bonuses/" + to);
+    await withTimeout(db.ref("scallywag").update({ ["bonuses/" + to]: (typeof curTo === "number" ? curTo : 0) + oldBonus, ["bonuses/" + from]: null }), 12000);
+  }
+  const oldNotices = toArr(await readNode(db, "notices/" + from));
+  if (oldNotices.length) {
+    await txn(db, P + "notices/" + to, cur => union(toArr(cur), oldNotices, (y, x) => (y.id || y.qid) === (x.id || x.qid)));
+    await setAt(db, P + "notices/" + from, null);
+  }
+
+  progress("Moving yer streak and daily log…");
+  const logSnap = await withTimeout(db.ref(P + "daily_log").orderByKey().startAt(from + "|").endAt(from + "|\uf8ff").once("value"), 15000);
+  for (const [k, qids] of Object.entries(logSnap.val() || {})) {
+    if (!k.startsWith(from + "|")) continue;
+    const newKey = to + "|" + k.slice(from.length + 1);
+    await txn(db, P + "daily_log/" + newKey, cur => union(toArr(cur), toArr(qids), (y, x) => y === x));
+    await setAt(db, P + "daily_log/" + k, null);
+  }
+
+  progress("Moving yer answers and history…");
+  const attempts = (await readNode(db, "attempts")) || {};
+  for (const [qid, list] of Object.entries(attempts)) {
+    if (toArr(list).some(a => a && a.user === from))
+      await txn(db, P + "attempts/" + qid, cur => toArr(cur).map(a => a && a.user === from ? { ...a, user: to } : a));
+  }
+  for (const key of ["answered", "flags"]) {
+    const data = (await readNode(db, key)) || {};
+    for (const [qid, list] of Object.entries(data)) {
+      if (toArr(list).includes(from))
+        await txn(db, P + key + "/" + qid, cur => [...new Set(toArr(cur).map(mapU))]);
+    }
+  }
+  const pulled = toArr(await readNode(db, "pulled"));
+  if (pulled.some(p => p && toArr(p.affectedUsers).includes(from)))
+    await txn(db, P + "pulled", cur => toArr(cur).map(p => p && p.affectedUsers ? { ...p, affectedUsers: toArr(p.affectedUsers).map(mapU) } : p));
+
+  progress("Moving yer questions and plank record…");
+  const questions = toArr(await readNode(db, "questions"));
+  if (questions.some(q => q && q.author === from))
+    await txn(db, P + "questions", cur => toArr(cur).map(q => q && q.author === from ? { ...q, author: to } : q));
+  const plank = await readNode(db, "plank");
+  if (plank && plank.victim === from) await txn(db, P + "plank", cur => cur && cur.victim === from ? { ...cur, victim: to } : cur);
+  const hist = toArr(await readNode(db, "plank_history"));
+  if (hist.some(h => h && h.victim === from))
+    await txn(db, P + "plank_history", cur => toArr(cur).map(h => h && h.victim === from ? { ...h, victim: to } : h));
+  const appeals = (await readNode(db, "appeals")) || {};
+  for (const [id, ap] of Object.entries(appeals)) {
+    if (ap && ap.user === from) await setAt(db, P + "appeals/" + id + "/user", to);
+  }
+  const caps = toArr(await readNode(db, "captains"));
+  if (caps.includes(from)) await txn(db, P + "captains", cur => [...new Set(toArr(cur).map(mapU))]);
+  try {
+    const oldKey = btoa(from).replace(/=/g, ""), newKey = btoa(to).replace(/=/g, "");
+    const tok = await readNode(db, "fcm_tokens/" + oldKey);
+    if (tok) { await setAt(db, P + "fcm_tokens/" + newKey, { ...tok, username: to }); await setAt(db, P + "fcm_tokens/" + oldKey, null); }
+  } catch {}
+  progress("Done!");
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online",  () => { _retryDelay = 2000; flushOutbox(); });
+  window.addEventListener("offline", () => emitSync());
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") flushOutbox(); });
+  setInterval(flushOutbox, 20000);
+  setTimeout(flushOutbox, 1500);
+}
+
 
 // ── Keys ──────────────────────────────────────────────────────────────────────
 const KEYS = {
@@ -137,9 +402,13 @@ const KEYS = {
   plank:        "plank",
   plankHistory: "plank_history",
   usedQ:        "used_questions",  // tracks which questions have been used so far
+  appeals:      "appeals",         // "I was right" appeals on wrong answers
+  captains:     "captains",        // usernames allowed to review any appeal
   username:     "username",
 };
 
+const APPEAL_AUTO_ACCEPT = 2;   // Trivia Bot questions: this many different players appealing the same answer accepts it
+const DEFAULT_CAPTAINS   = [];  // optional: put your in-app name here to review every appeal (or add a "captains" list in Firebase)
 const FLAG_THRESHOLD = 3;
 const DAILY_LIMIT    = 3;
 const DAY            = 86400000;
@@ -150,7 +419,7 @@ const SEED = [
   { id:"s01",  author:"Trivia Bot", subject:"Science", question:"What planet is closest to the Sun?", answer:"mercury", ts: Date.now()-DAY*299 },
   { id:"s02",  author:"Trivia Bot", subject:"Science", question:"What is the chemical symbol for gold?", answer:"au", ts: Date.now()-DAY*298 },
   { id:"s03",  author:"Trivia Bot", subject:"Science", question:"How many bones are in the adult human body?", answer:"206", ts: Date.now()-DAY*297 },
-  { id:"s04",  author:"Trivia Bot", subject:"Science", question:"What gas do plants absorb from the atmosphere during photosynthesis?", answer:"carbon dioxide", ts: Date.now()-DAY*296 },
+  { id:"s04",  author:"Trivia Bot", subject:"Science", question:"What gas do plants absorb from the atmosphere during photosynthesis?", answer:"carbon dioxide", alts:["co2"], ts: Date.now()-DAY*296 },
   { id:"s05",  author:"Trivia Bot", subject:"Science", question:"What is the hardest natural substance on Earth?", answer:"diamond", ts: Date.now()-DAY*295 },
   { id:"s06",  author:"Trivia Bot", subject:"Science", question:"What planet is known as the Red Planet?", answer:"mars", ts: Date.now()-DAY*294 },
   { id:"s07",  author:"Trivia Bot", subject:"Science", question:"What organ in the human body produces insulin?", answer:"pancreas", ts: Date.now()-DAY*293 },
@@ -158,7 +427,7 @@ const SEED = [
   { id:"s09",  author:"Trivia Bot", subject:"Science", question:"How many chromosomes do humans have?", answer:"46", ts: Date.now()-DAY*291 },
   { id:"s10",  author:"Trivia Bot", subject:"Science", question:"What is the chemical formula for water?", answer:"h2o", crewNote:"Chemical formula required — letters and numbers, matey!", ts: Date.now()-DAY*290 },
   { id:"s11",  author:"Trivia Bot", subject:"Science", question:"What force keeps planets in orbit around the Sun?", answer:"gravity", ts: Date.now()-DAY*289 },
-  { id:"s12",  author:"Trivia Bot", subject:"Science", question:"What is the powerhouse of the cell?", answer:"mitochondria", ts: Date.now()-DAY*288 },
+  { id:"s12",  author:"Trivia Bot", subject:"Science", question:"What is the powerhouse of the cell?", answer:"mitochondria", alts:["mitochondrion"], ts: Date.now()-DAY*288 },
   { id:"s13",  author:"Trivia Bot", subject:"Science", question:"How many elements are on the periodic table?", answer:"118", ts: Date.now()-DAY*287 },
   { id:"s14",  author:"Trivia Bot", subject:"Science", question:"What is the largest organ in the human body?", answer:"skin", ts: Date.now()-DAY*286 },
   { id:"s15",  author:"Trivia Bot", subject:"Science", question:"What planet has the most moons in our solar system?", answer:"saturn", ts: Date.now()-DAY*285 },
@@ -175,7 +444,7 @@ const SEED = [
   { id:"s26",  author:"Trivia Bot", subject:"Science", question:"What is the most common blood type in humans?", answer:"o positive", ts: Date.now()-DAY*274 },
   { id:"s27",  author:"Trivia Bot", subject:"Science", question:"How many teeth does an adult human have including wisdom teeth?", answer:"32", ts: Date.now()-DAY*273 },
   { id:"s28",  author:"Trivia Bot", subject:"Science", question:"What is the chemical symbol for sodium?", answer:"na", crewNote:"Chemical symbol required — two letters, matey!", ts: Date.now()-DAY*272 },
-  { id:"s29",  author:"Trivia Bot", subject:"Science", question:"What is the name of the closest star to Earth other than the Sun?", answer:"proxima centauri", crewNote:"Full name required, matey!", ts: Date.now()-DAY*271 },
+  { id:"s29",  author:"Trivia Bot", subject:"Science", question:"What is the name of the closest star to Earth other than the Sun?", answer:"proxima centauri", crewNote:"Full name required, matey!", alts:["proxima"], ts: Date.now()-DAY*271 },
   { id:"s30",  author:"Trivia Bot", subject:"Science", question:"What organ filters blood and produces urine?", answer:"kidney", ts: Date.now()-DAY*270 },
   { id:"s31",  author:"Trivia Bot", subject:"Science", question:"What is the speed of light in a vacuum approximately in miles per second?", answer:"186000", ts: Date.now()-DAY*269 },
   { id:"s32",  author:"Trivia Bot", subject:"Science", question:"What gas makes up about 21 percent of Earth's atmosphere?", answer:"oxygen", ts: Date.now()-DAY*268 },
@@ -204,15 +473,15 @@ const SEED = [
   { id:"h18",  author:"Trivia Bot", subject:"History", question:"Who invented the telephone in 1876?", answer:"alexander graham bell", crewNote:"Full name required, matey!", ts: Date.now()-DAY*247 },
   { id:"h19",  author:"Trivia Bot", subject:"History", question:"What Roman amphitheater completed around 80 AD could hold up to 80000 spectators?", answer:"colosseum", ts: Date.now()-DAY*246 },
   { id:"h20",  author:"Trivia Bot", subject:"History", question:"Who was the leader of Nazi Germany during World War II?", answer:"adolf hitler", crewNote:"Full name required, matey!", ts: Date.now()-DAY*245 },
-  { id:"h21",  author:"Trivia Bot", subject:"History", question:"What ancient civilization built Machu Picchu?", answer:"inca", ts: Date.now()-DAY*244 },
+  { id:"h21",  author:"Trivia Bot", subject:"History", question:"What ancient civilization built Machu Picchu?", answer:"inca", alts:["incas", "inca empire", "incan"], ts: Date.now()-DAY*244 },
   { id:"h22",  author:"Trivia Bot", subject:"History", question:"In what year did Christopher Columbus first reach the Americas?", answer:"1492", ts: Date.now()-DAY*243 },
   { id:"h23",  author:"Trivia Bot", subject:"History", question:"What war was fought between North Korea and South Korea from 1950 to 1953?", answer:"korean war", ts: Date.now()-DAY*242 },
   { id:"h24",  author:"Trivia Bot", subject:"History", question:"Who was the first Roman Emperor?", answer:"augustus", ts: Date.now()-DAY*241 },
-  { id:"h25",  author:"Trivia Bot", subject:"History", question:"What country did the United States purchase Alaska from in 1867?", answer:"russia", ts: Date.now()-DAY*240 },
+  { id:"h25",  author:"Trivia Bot", subject:"History", question:"What country did the United States purchase Alaska from in 1867?", answer:"russia", alts:["russian federation"], ts: Date.now()-DAY*240 },
   { id:"h26",  author:"Trivia Bot", subject:"History", question:"What ancient wonder was a giant statue located on the Greek island of Rhodes?", answer:"colossus of rhodes", ts: Date.now()-DAY*239 },
   { id:"h27",  author:"Trivia Bot", subject:"History", question:"In what year did the United States enter World War II?", answer:"1941", ts: Date.now()-DAY*238 },
   { id:"h28",  author:"Trivia Bot", subject:"History", question:"Who was the British Prime Minister during most of World War II?", answer:"winston churchill", crewNote:"Full name required, matey!", ts: Date.now()-DAY*237 },
-  { id:"h29",  author:"Trivia Bot", subject:"History", question:"What empire did Genghis Khan found in the 13th century?", answer:"mongol empire", ts: Date.now()-DAY*236 },
+  { id:"h29",  author:"Trivia Bot", subject:"History", question:"What empire did Genghis Khan found in the 13th century?", answer:"mongol empire", alts:["mongols", "mongol"], ts: Date.now()-DAY*236 },
   { id:"h30",  author:"Trivia Bot", subject:"History", question:"What year was the United Nations founded?", answer:"1945", ts: Date.now()-DAY*235 },
   { id:"h31",  author:"Trivia Bot", subject:"History", question:"Who was the first President of South Africa after apartheid ended?", answer:"nelson mandela", crewNote:"Full name required, matey!", ts: Date.now()-DAY*234 },
   { id:"h32",  author:"Trivia Bot", subject:"History", question:"What ancient city was destroyed by the eruption of Mount Vesuvius in 79 AD?", answer:"pompeii", ts: Date.now()-DAY*233 },
@@ -232,7 +501,7 @@ const SEED = [
   { id:"g09",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Japan?", answer:"tokyo", ts: Date.now()-DAY*221 },
   { id:"g10",  author:"Trivia Bot", subject:"Geography", question:"What is the longest mountain range in the world?", answer:"andes", ts: Date.now()-DAY*220 },
   { id:"g11",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Brazil?", answer:"brasilia", ts: Date.now()-DAY*219 },
-  { id:"g12",  author:"Trivia Bot", subject:"Geography", question:"What is the largest country in the world by land area?", answer:"russia", ts: Date.now()-DAY*218 },
+  { id:"g12",  author:"Trivia Bot", subject:"Geography", question:"What is the largest country in the world by land area?", answer:"russia", alts:["russian federation"], ts: Date.now()-DAY*218 },
   { id:"g13",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Germany?", answer:"berlin", ts: Date.now()-DAY*217 },
   { id:"g14",  author:"Trivia Bot", subject:"Geography", question:"What US state is the largest by land area?", answer:"alaska", ts: Date.now()-DAY*216 },
   { id:"g16",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of France?", answer:"paris", ts: Date.now()-DAY*214 },
@@ -247,7 +516,7 @@ const SEED = [
   { id:"g25",  author:"Trivia Bot", subject:"Geography", question:"What US state is known as the Sunshine State?", answer:"florida", ts: Date.now()-DAY*205 },
   { id:"g26",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Argentina?", answer:"buenos aires", ts: Date.now()-DAY*204 },
   { id:"g27",  author:"Trivia Bot", subject:"Geography", question:"What mountain range separates Europe from Asia in Russia?", answer:"ural mountains", ts: Date.now()-DAY*203 },
-  { id:"g28",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Mexico?", answer:"mexico city", ts: Date.now()-DAY*202 },
+  { id:"g28",  author:"Trivia Bot", subject:"Geography", question:"What is the capital of Mexico?", answer:"mexico city", alts:["ciudad de mexico", "cdmx"], ts: Date.now()-DAY*202 },
   { id:"g29",  author:"Trivia Bot", subject:"Geography", question:"What is the largest lake in North America?", answer:"lake superior", ts: Date.now()-DAY*201 },
   { id:"g30",  author:"Trivia Bot", subject:"Geography", question:"What country contains the Amazon rainforest's largest portion?", answer:"brazil", ts: Date.now()-DAY*200 },
 
@@ -299,8 +568,8 @@ const SEED = [
   { id:"sp16", author:"Trivia Bot", subject:"Sports", question:"In what city are the headquarters of the International Olympic Committee?", answer:"lausanne", ts: Date.now()-DAY*154 },
   { id:"sp17", author:"Trivia Bot", subject:"Sports", question:"How long is a standard marathon in miles?", answer:"26.2", ts: Date.now()-DAY*153 },
   { id:"sp19", author:"Trivia Bot", subject:"Sports", question:"How many players are on a baseball team on the field?", answer:"9", ts: Date.now()-DAY*151 },
-  { id:"sp20", author:"Trivia Bot", subject:"Sports", question:"What country has won the most Olympic gold medals in history?", answer:"united states", ts: Date.now()-DAY*150 },
-  { id:"sp23", author:"Trivia Bot", subject:"Sports", question:"What boxer was known as The Greatest and was Olympic gold medalist in 1960?", answer:"muhammad ali", crewNote:"Full name required, matey!", ts: Date.now()-DAY*147 },
+  { id:"sp20", author:"Trivia Bot", subject:"Sports", question:"What country has won the most Olympic gold medals in history?", answer:"united states", alts:["america", "united states of america"], ts: Date.now()-DAY*150 },
+  { id:"sp23", author:"Trivia Bot", subject:"Sports", question:"What boxer was known as The Greatest and was Olympic gold medalist in 1960?", answer:"muhammad ali", crewNote:"Full name required, matey!", alts:["cassius clay", "cassius marcellus clay"], ts: Date.now()-DAY*147 },
   { id:"sp24", author:"Trivia Bot", subject:"Sports", question:"What is the distance of a standard Olympic swimming pool in meters?", answer:"50", ts: Date.now()-DAY*146 },
   { id:"sp25", author:"Trivia Bot", subject:"Sports", question:"What country invented the sport of ice hockey?", answer:"canada", ts: Date.now()-DAY*145 },
 
@@ -308,11 +577,11 @@ const SEED = [
   { id:"l01",  author:"Trivia Bot", subject:"Literature", question:"Who wrote Romeo and Juliet?", answer:"william shakespeare", crewNote:"Full name required, matey!", ts: Date.now()-DAY*144 },
   { id:"l02",  author:"Trivia Bot", subject:"Literature", question:"Who wrote The Great Gatsby?", answer:"f scott fitzgerald", crewNote:"Full name required, matey!", ts: Date.now()-DAY*143 },
   { id:"l03",  author:"Trivia Bot", subject:"Literature", question:"What is the first book of the Bible?", answer:"genesis", ts: Date.now()-DAY*142 },
-  { id:"l04",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the dystopian novel 1984?", answer:"george orwell", crewNote:"Full name required, matey!", ts: Date.now()-DAY*141 },
-  { id:"l05",  author:"Trivia Bot", subject:"Literature", question:"What fictional detective was created by Arthur Conan Doyle?", answer:"sherlock holmes", ts: Date.now()-DAY*140 },
+  { id:"l04",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the dystopian novel 1984?", answer:"george orwell", crewNote:"Full name required, matey!", alts:["eric blair", "eric arthur blair"], ts: Date.now()-DAY*141 },
+  { id:"l05",  author:"Trivia Bot", subject:"Literature", question:"What fictional detective was created by Arthur Conan Doyle?", answer:"sherlock holmes", alts:["holmes"], ts: Date.now()-DAY*140 },
   { id:"l06",  author:"Trivia Bot", subject:"Literature", question:"Who wrote Pride and Prejudice?", answer:"jane austen", crewNote:"Full name required, matey!", ts: Date.now()-DAY*139 },
   { id:"l07",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the epic poems the Iliad and the Odyssey?", answer:"homer", ts: Date.now()-DAY*138 },
-  { id:"l08",  author:"Trivia Bot", subject:"Literature", question:"What is the name of the hobbit hero in The Hobbit by J.R.R. Tolkien?", answer:"bilbo baggins", ts: Date.now()-DAY*137 },
+  { id:"l08",  author:"Trivia Bot", subject:"Literature", question:"What is the name of the hobbit hero in The Hobbit by J.R.R. Tolkien?", answer:"bilbo baggins", alts:["bilbo"], ts: Date.now()-DAY*137 },
   { id:"l09",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the play Death of a Salesman?", answer:"arthur miller", crewNote:"Full name required, matey!", ts: Date.now()-DAY*136 },
   { id:"l10",  author:"Trivia Bot", subject:"Literature", question:"What classic novel begins with the line: It was the best of times it was the worst of times?", answer:"a tale of two cities", ts: Date.now()-DAY*135 },
   { id:"l11",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel To Kill a Mockingbird?", answer:"harper lee", crewNote:"Full name required, matey!", ts: Date.now()-DAY*134 },
@@ -323,7 +592,7 @@ const SEED = [
   { id:"l17",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Crime and Punishment?", answer:"fyodor dostoevsky", crewNote:"Full name required, matey!", ts: Date.now()-DAY*128 },
   { id:"l18",  author:"Trivia Bot", subject:"Literature", question:"What Shakespeare play features the character Hamlet?", answer:"hamlet", ts: Date.now()-DAY*127 },
   { id:"l19",  author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel The Catcher in the Rye?", answer:"j d salinger", crewNote:"Full name required, matey!", ts: Date.now()-DAY*126 },
-  { id:"l20",  author:"Trivia Bot", subject:"Literature", question:"What is the pen name of author Samuel Clemens?", answer:"mark twain", crewNote:"Pen name required, ye landlubber!", ts: Date.now()-DAY*125 },
+  { id:"l20",  author:"Trivia Bot", subject:"Literature", question:"What is the pen name of author Samuel Clemens?", answer:"mark twain", crewNote:"Pen name required, ye landlubber!", alts:["samuel clemens", "samuel langhorne clemens"], ts: Date.now()-DAY*125 },
 
   // ── Math & Numbers (15) ──────────────────────────────────────────────────
   { id:"m01",  author:"Trivia Bot", subject:"Math", question:"What is the square root of 144?", answer:"12", ts: Date.now()-DAY*124 },
@@ -348,13 +617,13 @@ const SEED = [
   { id:"f04",  author:"Trivia Bot", subject:"Food & Drink", question:"What nut is used to make marzipan?", answer:"almond", ts: Date.now()-DAY*106 },
   { id:"f06",  author:"Trivia Bot", subject:"Food & Drink", question:"What is the most expensive spice in the world by weight?", answer:"saffron", ts: Date.now()-DAY*104 },
   { id:"f07",  author:"Trivia Bot", subject:"Food & Drink", question:"What country produces the most coffee in the world?", answer:"brazil", ts: Date.now()-DAY*103 },
-  { id:"f08",  author:"Trivia Bot", subject:"Food & Drink", question:"What is the main ingredient in hummus?", answer:"chickpeas", ts: Date.now()-DAY*102 },
+  { id:"f08",  author:"Trivia Bot", subject:"Food & Drink", question:"What is the main ingredient in hummus?", answer:"chickpeas", alts:["garbanzo beans", "garbanzo", "garbanzos", "chick peas", "chickpea"], ts: Date.now()-DAY*102 },
   { id:"f09",  author:"Trivia Bot", subject:"Food & Drink", question:"What type of pastry is used in a traditional beef Wellington?", answer:"puff pastry", ts: Date.now()-DAY*101 },
-  { id:"f10",  author:"Trivia Bot", subject:"Food & Drink", question:"What country is the origin of Gouda cheese?", answer:"netherlands", ts: Date.now()-DAY*100 },
+  { id:"f10",  author:"Trivia Bot", subject:"Food & Drink", question:"What country is the origin of Gouda cheese?", answer:"netherlands", alts:["holland"], ts: Date.now()-DAY*100 },
   { id:"f11",  author:"Trivia Bot", subject:"Food & Drink", question:"What is the Italian term for the first course of a meal?", answer:"antipasto", ts: Date.now()-DAY*99 },
   { id:"f12",  author:"Trivia Bot", subject:"Food & Drink", question:"What fruit is used to make wine?", answer:"grapes", ts: Date.now()-DAY*98 },
   { id:"f14",  author:"Trivia Bot", subject:"Food & Drink", question:"What cocktail is made from vodka tomato juice and spices?", answer:"bloody mary", ts: Date.now()-DAY*96 },
-  { id:"f15",  author:"Trivia Bot", subject:"Food & Drink", question:"What nut gives Nutella its distinctive flavor alongside chocolate?", answer:"hazelnut", ts: Date.now()-DAY*95 },
+  { id:"f15",  author:"Trivia Bot", subject:"Food & Drink", question:"What nut gives Nutella its distinctive flavor alongside chocolate?", answer:"hazelnut", alts:["filbert", "hazelnuts"], ts: Date.now()-DAY*95 },
 
   // ── Music (20) ───────────────────────────────────────────────────────────
   { id:"mu01", author:"Trivia Bot", subject:"Music", question:"How many strings does a standard guitar have?", answer:"6", ts: Date.now()-DAY*94 },
@@ -362,27 +631,27 @@ const SEED = [
   { id:"mu03", author:"Trivia Bot", subject:"Music", question:"Who composed the Four Seasons?", answer:"vivaldi", ts: Date.now()-DAY*92 },
   { id:"mu04", author:"Trivia Bot", subject:"Music", question:"What band included John Lennon Paul McCartney George Harrison and Ringo Starr?", answer:"the beatles", ts: Date.now()-DAY*91 },
   { id:"mu05", author:"Trivia Bot", subject:"Music", question:"What is the term for the speed of a musical piece?", answer:"tempo", ts: Date.now()-DAY*90 },
-  { id:"mu06", author:"Trivia Bot", subject:"Music", question:"Who is known as the King of Rock and Roll?", answer:"elvis presley", crewNote:"Full name required, matey!", ts: Date.now()-DAY*89 },
+  { id:"mu06", author:"Trivia Bot", subject:"Music", question:"Who is known as the King of Rock and Roll?", answer:"elvis presley", crewNote:"Full name required, matey!", alts:["elvis"], ts: Date.now()-DAY*89 },
   { id:"mu07", author:"Trivia Bot", subject:"Music", question:"How many keys are on a standard piano?", answer:"88", ts: Date.now()-DAY*88 },
   { id:"mu08", author:"Trivia Bot", subject:"Music", question:"What Mozart opera features the Queen of the Night aria?", answer:"the magic flute", ts: Date.now()-DAY*87 },
   { id:"mu09", author:"Trivia Bot", subject:"Music", question:"Who wrote the Ninth Symphony also known as the Choral Symphony?", answer:"beethoven", ts: Date.now()-DAY*86 },
-  { id:"mu10", author:"Trivia Bot", subject:"Music", question:"What decade did hip-hop music originate?", answer:"1970s", ts: Date.now()-DAY*85 },
+  { id:"mu10", author:"Trivia Bot", subject:"Music", question:"What decade did hip-hop music originate?", answer:"1970s", alts:["70s", "seventies", "the seventies", "the 70s"], ts: Date.now()-DAY*85 },
   { id:"mu12", author:"Trivia Bot", subject:"Music", question:"What singer is known as the Queen of Soul?", answer:"aretha franklin", crewNote:"Full name required, matey!", ts: Date.now()-DAY*83 },
   { id:"mu13", author:"Trivia Bot", subject:"Music", question:"What instrument did Miles Davis famously play?", answer:"trumpet", ts: Date.now()-DAY*82 },
   { id:"mu14", author:"Trivia Bot", subject:"Music", question:"What is the name of the song that begins with the lyrics Imagine there is no heaven?", answer:"imagine", ts: Date.now()-DAY*81 },
   { id:"mu16", author:"Trivia Bot", subject:"Music", question:"What musical term means to gradually get louder?", answer:"crescendo", ts: Date.now()-DAY*79 },
   { id:"mu18", author:"Trivia Bot", subject:"Music", question:"What country does the musical style of Bossa Nova come from?", answer:"brazil", ts: Date.now()-DAY*77 },
   { id:"mu19", author:"Trivia Bot", subject:"Music", question:"What instrument is Yo-Yo Ma famous for playing?", answer:"cello", ts: Date.now()-DAY*76 },
-  { id:"mu20", author:"Trivia Bot", subject:"Music", question:"What band is Mick Jagger the lead singer of?", answer:"the rolling stones", ts: Date.now()-DAY*75 },
+  { id:"mu20", author:"Trivia Bot", subject:"Music", question:"What band is Mick Jagger the lead singer of?", answer:"the rolling stones", alts:["rolling stones", "stones"], ts: Date.now()-DAY*75 },
 
   // ── Art & Architecture (10) ───────────────────────────────────────────────
-  { id:"a01",  author:"Trivia Bot", subject:"Art", question:"Who painted the Mona Lisa?", answer:"leonardo da vinci", ts: Date.now()-DAY*74 },
+  { id:"a01",  author:"Trivia Bot", subject:"Art", question:"Who painted the Mona Lisa?", answer:"leonardo da vinci", alts:["da vinci", "leonardo"], ts: Date.now()-DAY*74 },
   { id:"a02",  author:"Trivia Bot", subject:"Art", question:"What Dutch painter cut off his own ear?", answer:"vincent van gogh", ts: Date.now()-DAY*73 },
   { id:"a03",  author:"Trivia Bot", subject:"Art", question:"What building in Paris is a famous art museum and former royal palace?", answer:"louvre", ts: Date.now()-DAY*72 },
   { id:"a04",  author:"Trivia Bot", subject:"Art", question:"Who painted the Sistine Chapel ceiling?", answer:"michelangelo", ts: Date.now()-DAY*71 },
   { id:"a05",  author:"Trivia Bot", subject:"Art", question:"What architectural style features pointed arches ribbed vaults and flying buttresses?", answer:"gothic", ts: Date.now()-DAY*70 },
   { id:"a06",  author:"Trivia Bot", subject:"Art", question:"What Spanish artist co-founded Cubism?", answer:"pablo picasso", ts: Date.now()-DAY*69 },
-  { id:"a07",  author:"Trivia Bot", subject:"Art", question:"What is the name of the famous statue of a woman with no arms by the ancient Greeks?", answer:"venus de milo", ts: Date.now()-DAY*68 },
+  { id:"a07",  author:"Trivia Bot", subject:"Art", question:"What is the name of the famous statue of a woman with no arms by the ancient Greeks?", answer:"venus de milo", alts:["aphrodite of milos"], ts: Date.now()-DAY*68 },
   { id:"a08",  author:"Trivia Bot", subject:"Art", question:"What American artist is famous for his paintings of soup cans?", answer:"andy warhol", ts: Date.now()-DAY*67 },
   { id:"a09",  author:"Trivia Bot", subject:"Art", question:"What country is the artist Frida Kahlo from?", answer:"mexico", ts: Date.now()-DAY*66 },
 
@@ -393,7 +662,7 @@ const SEED = [
   { id:"t04",  author:"Trivia Bot", subject:"Technology", question:"Who co-founded Apple with Steve Jobs?", answer:"steve wozniak", crewNote:"Full name required, matey!", ts: Date.now()-DAY*61 },
   { id:"t06",  author:"Trivia Bot", subject:"Technology", question:"What does GPS stand for?", answer:"global positioning system", ts: Date.now()-DAY*59 },
   { id:"t07",  author:"Trivia Bot", subject:"Technology", question:"Who co-founded Microsoft with Paul Allen in 1975?", answer:"bill gates", crewNote:"Full name required, matey!", ts: Date.now()-DAY*58 },
-  { id:"t08",  author:"Trivia Bot", subject:"Technology", question:"What company owns Instagram?", answer:"meta", ts: Date.now()-DAY*57 },
+  { id:"t08",  author:"Trivia Bot", subject:"Technology", question:"What company owns Instagram?", answer:"meta", alts:["facebook", "meta platforms", "facebook inc"], ts: Date.now()-DAY*57 },
   { id:"t09",  author:"Trivia Bot", subject:"Technology", question:"What does URL stand for?", answer:"uniform resource locator", ts: Date.now()-DAY*56 },
   { id:"t10",  author:"Trivia Bot", subject:"Technology", question:"What programming language is named after a type of snake?", answer:"python", ts: Date.now()-DAY*55 },
 
@@ -406,13 +675,13 @@ const SEED = [
   { id:"fi07", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Apple?", answer:"aapl", crewNote:"Stock ticker symbol — all caps, matey!", ts: Date.now()-DAY*48 },
   { id:"fi08", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Tesla?", answer:"tsla", crewNote:"Stock ticker symbol — all caps, matey!", ts: Date.now()-DAY*47 },
   { id:"fi09", author:"Trivia Bot", subject:"Finance", question:"What term describes a stock that pays regular cash distributions to shareholders?", answer:"dividend", ts: Date.now()-DAY*46 },
-  { id:"fi11", author:"Trivia Bot", subject:"Finance", question:"What does P/E ratio stand for in stock analysis?", answer:"price to earnings ratio", ts: Date.now()-DAY*44 },
+  { id:"fi11", author:"Trivia Bot", subject:"Finance", question:"What does P/E ratio stand for in stock analysis?", answer:"price to earnings ratio", alts:["pe ratio", "p/e ratio"], ts: Date.now()-DAY*44 },
   { id:"fi12", author:"Trivia Bot", subject:"Finance", question:"What famous investor is known as the Oracle of Omaha?", answer:"warren buffett", ts: Date.now()-DAY*43 },
   { id:"fi13", author:"Trivia Bot", subject:"Finance", question:"What is the term for spreading investments across different assets to reduce risk?", answer:"diversification", ts: Date.now()-DAY*42 },
   { id:"fi14", author:"Trivia Bot", subject:"Finance", question:"What does FDIC stand for?", answer:"federal deposit insurance corporation", ts: Date.now()-DAY*41 },
   { id:"fi15", author:"Trivia Bot", subject:"Finance", question:"What is the central bank of the United States called?", answer:"federal reserve", ts: Date.now()-DAY*40 },
   { id:"fi17", author:"Trivia Bot", subject:"Finance", question:"What does ROI stand for?", answer:"return on investment", ts: Date.now()-DAY*38 },
-  { id:"fi18", author:"Trivia Bot", subject:"Finance", question:"What is the name of the index that tracks 30 large American publicly traded companies?", answer:"dow jones industrial average", ts: Date.now()-DAY*37 },
+  { id:"fi18", author:"Trivia Bot", subject:"Finance", question:"What is the name of the index that tracks 30 large American publicly traded companies?", answer:"dow jones industrial average", alts:["dow jones", "djia", "the dow", "dow"], ts: Date.now()-DAY*37 },
 
   // ── Additional Science (10) ───────────────────────────────────────────────
   { id:"s36", author:"Trivia Bot", subject:"Science", question:"What is the name of the process by which plants make food using sunlight?", answer:"photosynthesis", ts: Date.now()-DAY*34 },
@@ -420,11 +689,11 @@ const SEED = [
   { id:"s38", author:"Trivia Bot", subject:"Science", question:"What is the scientific name for the study of the universe?", answer:"cosmology", ts: Date.now()-DAY*32 },
   { id:"s39", author:"Trivia Bot", subject:"Science", question:"What is the most abundant element in the universe?", answer:"hydrogen", ts: Date.now()-DAY*31 },
   { id:"s40", author:"Trivia Bot", subject:"Science", question:"What is the term for an animal that eats only plants?", answer:"herbivore", ts: Date.now()-DAY*30 },
-  { id:"s41", author:"Trivia Bot", subject:"Science", question:"What bone protects the human brain?", answer:"skull", ts: Date.now()-DAY*29 },
+  { id:"s41", author:"Trivia Bot", subject:"Science", question:"What bone protects the human brain?", answer:"skull", alts:["cranium"], ts: Date.now()-DAY*29 },
   { id:"s42", author:"Trivia Bot", subject:"Science", question:"What is the chemical symbol for silver?", answer:"ag", crewNote:"Chemical symbol required — two letters, matey!", ts: Date.now()-DAY*28 },
   { id:"s43", author:"Trivia Bot", subject:"Science", question:"How many pairs of chromosomes do humans have?", answer:"23", ts: Date.now()-DAY*27 },
   { id:"s44", author:"Trivia Bot", subject:"Science", question:"What is the name of the galaxy that contains our solar system?", answer:"milky way", ts: Date.now()-DAY*26 },
-  { id:"s45", author:"Trivia Bot", subject:"Science", question:"What vitamin does the human body produce when exposed to sunlight?", answer:"vitamin d", ts: Date.now()-DAY*25 },
+  { id:"s45", author:"Trivia Bot", subject:"Science", question:"What vitamin does the human body produce when exposed to sunlight?", answer:"vitamin d", alts:["d"], ts: Date.now()-DAY*25 },
 
   // ── Additional History (10) ───────────────────────────────────────────────
   { id:"h36", author:"Trivia Bot", subject:"History", question:"What was the name of the first permanent English settlement in America founded in 1607?", answer:"jamestown", ts: Date.now()-DAY*24 },
@@ -435,11 +704,11 @@ const SEED = [
   { id:"h41", author:"Trivia Bot", subject:"History", question:"Who was the last Tsar of Russia?", answer:"nicholas ii", crewNote:"Include the numeral, matey!", ts: Date.now()-DAY*19 },
   { id:"h43", author:"Trivia Bot", subject:"History", question:"Who was the first woman to serve as US Secretary of State?", answer:"madeleine albright", crewNote:"Full name required, matey!", ts: Date.now()-DAY*17 },
   { id:"h44", author:"Trivia Bot", subject:"History", question:"What treaty ended World War I?", answer:"treaty of versailles", ts: Date.now()-DAY*16 },
-  { id:"h45", author:"Trivia Bot", subject:"History", question:"What ancient civilization built the Parthenon?", answer:"greeks", ts: Date.now()-DAY*15 },
+  { id:"h45", author:"Trivia Bot", subject:"History", question:"What ancient civilization built the Parthenon?", answer:"greeks", alts:["greece", "greek", "ancient greece"], ts: Date.now()-DAY*15 },
 
   // ── Additional Geography (10) ─────────────────────────────────────────────
   { id:"g31", author:"Trivia Bot", subject:"Geography", question:"What is the capital of South Korea?", answer:"seoul", ts: Date.now()-DAY*14 },
-  { id:"g32", author:"Trivia Bot", subject:"Geography", question:"What is the capital of India?", answer:"new delhi", ts: Date.now()-DAY*13 },
+  { id:"g32", author:"Trivia Bot", subject:"Geography", question:"What is the capital of India?", answer:"new delhi", alts:["delhi"], ts: Date.now()-DAY*13 },
   { id:"g33", author:"Trivia Bot", subject:"Geography", question:"What is the longest river in the United States?", answer:"missouri river", ts: Date.now()-DAY*12 },
   { id:"g34", author:"Trivia Bot", subject:"Geography", question:"What African country has the largest population?", answer:"nigeria", ts: Date.now()-DAY*11 },
   { id:"g35", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Australia's most populous state New South Wales?", answer:"sydney", ts: Date.now()-DAY*10 },
@@ -464,7 +733,7 @@ const SEED = [
   { id:"mu21", author:"Trivia Bot", subject:"Music", question:"What American singer is known as the Boss?", answer:"bruce springsteen", crewNote:"Full name required, matey!", ts: Date.now()-3600000*4 },
   { id:"mu22", author:"Trivia Bot", subject:"Music", question:"What is the name of the lead singer of U2?", answer:"bono", ts: Date.now()-3600000*3 },
   { id:"mu23", author:"Trivia Bot", subject:"Music", question:"How many musicians are in a quartet?", answer:"4", ts: Date.now()-3600000*2 },
-  { id:"mu24", author:"Trivia Bot", subject:"Music", question:"What city is considered the birthplace of jazz?", answer:"new orleans", ts: Date.now()-3600000 },
+  { id:"mu24", author:"Trivia Bot", subject:"Music", question:"What city is considered the birthplace of jazz?", answer:"new orleans", alts:["nola"], ts: Date.now()-3600000 },
   { id:"mu25", author:"Trivia Bot", subject:"Music", question:"What is the name of Taylor Swift's debut album released in 2006?", answer:"taylor swift", ts: Date.now()-1800000 },
   { id:"mu27", author:"Trivia Bot", subject:"Music", question:"What is the term for the highness or lowness of a musical sound?", answer:"pitch", ts: Date.now()-1600000 },
   { id:"mu28", author:"Trivia Bot", subject:"Music", question:"What band recorded the album Dark Side of the Moon in 1973?", answer:"pink floyd", ts: Date.now()-1500000 },
@@ -481,7 +750,7 @@ const SEED = [
   { id:"t20", author:"Trivia Bot", subject:"Technology", question:"What social media platform is known for short video content and was originally called Musical.ly?", answer:"tiktok", ts: Date.now()-300000 },
 
   // ── Additional Literature (10) ────────────────────────────────────────────
-  { id:"l21", author:"Trivia Bot", subject:"Literature", question:"What is the name of the whale hunter in Moby Dick?", answer:"captain ahab", ts: Date.now()-290000 },
+  { id:"l21", author:"Trivia Bot", subject:"Literature", question:"What is the name of the whale hunter in Moby Dick?", answer:"captain ahab", alts:["ahab"], ts: Date.now()-290000 },
   { id:"l22", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Brave New World?", answer:"aldous huxley", crewNote:"Full name required, matey!", ts: Date.now()-280000 },
   { id:"l23", author:"Trivia Bot", subject:"Literature", question:"What novel by John Steinbeck follows the Joad family during the Great Depression?", answer:"the grapes of wrath", ts: Date.now()-270000 },
   { id:"l24", author:"Trivia Bot", subject:"Literature", question:"Who wrote the Diary of a Young Girl also known as Anne Frank's diary?", answer:"anne frank", crewNote:"Full name required, matey!", ts: Date.now()-260000 },
@@ -507,7 +776,7 @@ const SEED = [
   { id:"sn03", author:"Trivia Bot", subject:"Science", question:"What is the name of the bone in the upper arm?", answer:"humerus", ts: Date.now()-DAY*497 },
   { id:"sn04", author:"Trivia Bot", subject:"Science", question:"What is the chemical symbol for potassium?", answer:"k", crewNote:"Chemical symbol required — one letter, matey!", ts: Date.now()-DAY*496 },
   { id:"sn05", author:"Trivia Bot", subject:"Science", question:"What planet has a day longer than its year?", answer:"venus", ts: Date.now()-DAY*495 },
-  { id:"sn06", author:"Trivia Bot", subject:"Science", question:"What is the name of the cell that carries oxygen in the blood?", answer:"red blood cell", ts: Date.now()-DAY*494 },
+  { id:"sn06", author:"Trivia Bot", subject:"Science", question:"What is the name of the cell that carries oxygen in the blood?", answer:"red blood cell", alts:["erythrocyte", "rbc"], ts: Date.now()-DAY*494 },
   { id:"sn07", author:"Trivia Bot", subject:"Science", question:"What is the term for the bending of light as it passes through a lens?", answer:"refraction", ts: Date.now()-DAY*493 },
   { id:"sn08", author:"Trivia Bot", subject:"Science", question:"What is the name of the process by which a solid turns directly into a gas?", answer:"sublimation", ts: Date.now()-DAY*492 },
   { id:"sn09", author:"Trivia Bot", subject:"Science", question:"How many legs does a spider have?", answer:"8", ts: Date.now()-DAY*491 },
@@ -515,18 +784,18 @@ const SEED = [
   { id:"sn11", author:"Trivia Bot", subject:"Science", question:"What is the name of the force that opposes motion between two surfaces?", answer:"friction", ts: Date.now()-DAY*489 },
   { id:"sn12", author:"Trivia Bot", subject:"Science", question:"What type of rock is formed from cooled lava?", answer:"igneous", ts: Date.now()-DAY*488 },
   { id:"sn13", author:"Trivia Bot", subject:"Science", question:"What is the name of the pigment that gives skin its color?", answer:"melanin", ts: Date.now()-DAY*487 },
-  { id:"sn14", author:"Trivia Bot", subject:"Science", question:"What is the unit of frequency?", answer:"hertz", ts: Date.now()-DAY*486 },
+  { id:"sn14", author:"Trivia Bot", subject:"Science", question:"What is the unit of frequency?", answer:"hertz", alts:["hz"], ts: Date.now()-DAY*486 },
   { id:"sn15", author:"Trivia Bot", subject:"Science", question:"What is the name of the protective layer of gases surrounding Earth?", answer:"atmosphere", ts: Date.now()-DAY*485 },
   { id:"sn16", author:"Trivia Bot", subject:"Science", question:"What is the smallest unit of life?", answer:"cell", ts: Date.now()-DAY*484 },
-  { id:"sn17", author:"Trivia Bot", subject:"Science", question:"What gas is produced when baking soda and vinegar are combined?", answer:"carbon dioxide", ts: Date.now()-DAY*483 },
-  { id:"sn18", author:"Trivia Bot", subject:"Science", question:"What is the name of the longest bone in the human body?", answer:"femur", ts: Date.now()-DAY*482 },
+  { id:"sn17", author:"Trivia Bot", subject:"Science", question:"What gas is produced when baking soda and vinegar are combined?", answer:"carbon dioxide", alts:["co2"], ts: Date.now()-DAY*483 },
+  { id:"sn18", author:"Trivia Bot", subject:"Science", question:"What is the name of the longest bone in the human body?", answer:"femur", alts:["thigh bone", "thighbone"], ts: Date.now()-DAY*482 },
   { id:"sn20", author:"Trivia Bot", subject:"Science", question:"What is the name of the scientist who developed the theory of general relativity?", answer:"albert einstein", crewNote:"Full name required, matey!", ts: Date.now()-DAY*480 },
 
   // ── History — new batch (20) ──────────────────────────────────────────────
-  { id:"hn01", author:"Trivia Bot", subject:"History", question:"What country was the first to land a rover on the moon in 1970?", answer:"soviet union", ts: Date.now()-DAY*479 },
+  { id:"hn01", author:"Trivia Bot", subject:"History", question:"What country was the first to land a rover on the moon in 1970?", answer:"soviet union", alts:["ussr"], ts: Date.now()-DAY*479 },
   { id:"hn02", author:"Trivia Bot", subject:"History", question:"What US President was assassinated in Dallas in 1963?", answer:"john f kennedy", crewNote:"Full name required, matey!", ts: Date.now()-DAY*478 },
   { id:"hn03", author:"Trivia Bot", subject:"History", question:"What year was the Magna Carta signed?", answer:"1215", ts: Date.now()-DAY*477 },
-  { id:"hn04", author:"Trivia Bot", subject:"History", question:"What ancient civilization built the Sphinx?", answer:"egyptians", ts: Date.now()-DAY*476 },
+  { id:"hn04", author:"Trivia Bot", subject:"History", question:"What ancient civilization built the Sphinx?", answer:"egyptians", alts:["egypt", "egyptian", "ancient egypt"], ts: Date.now()-DAY*476 },
   { id:"hn05", author:"Trivia Bot", subject:"History", question:"What war was fought between the US and Britain from 1812 to 1815?", answer:"war of 1812", ts: Date.now()-DAY*475 },
   { id:"hn06", author:"Trivia Bot", subject:"History", question:"What German city was divided by a wall from 1961 to 1989?", answer:"berlin", ts: Date.now()-DAY*474 },
   { id:"hn07", author:"Trivia Bot", subject:"History", question:"Who was the first woman to fly solo across the Atlantic Ocean in 1932?", answer:"amelia earhart", crewNote:"Full name required, matey!", ts: Date.now()-DAY*473 },
@@ -553,15 +822,15 @@ const SEED = [
   { id:"gn07", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Sweden?", answer:"stockholm", ts: Date.now()-DAY*453 },
   { id:"gn08", author:"Trivia Bot", subject:"Geography", question:"What US state is known as the Lone Star State?", answer:"texas", ts: Date.now()-DAY*452 },
   { id:"gn09", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Poland?", answer:"warsaw", ts: Date.now()-DAY*451 },
-  { id:"gn10", author:"Trivia Bot", subject:"Geography", question:"What is the name of the body of water between England and France?", answer:"english channel", ts: Date.now()-DAY*450 },
+  { id:"gn10", author:"Trivia Bot", subject:"Geography", question:"What is the name of the body of water between England and France?", answer:"english channel", alts:["channel", "the channel"], ts: Date.now()-DAY*450 },
   { id:"gn11", author:"Trivia Bot", subject:"Geography", question:"What African country is home to the city of Timbuktu?", answer:"mali", ts: Date.now()-DAY*449 },
   { id:"gn12", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Austria?", answer:"vienna", ts: Date.now()-DAY*448 },
   { id:"gn13", author:"Trivia Bot", subject:"Geography", question:"What is the smallest US state by area?", answer:"rhode island", ts: Date.now()-DAY*447 },
   { id:"gn14", author:"Trivia Bot", subject:"Geography", question:"What country does the island of Sardinia belong to?", answer:"italy", ts: Date.now()-DAY*446 },
   { id:"gn15", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Pakistan?", answer:"islamabad", ts: Date.now()-DAY*445 },
-  { id:"gn16", author:"Trivia Bot", subject:"Geography", question:"What is the name of the strait between the Atlantic and Pacific Oceans at the southern tip of South America?", answer:"strait of magellan", ts: Date.now()-DAY*444 },
+  { id:"gn16", author:"Trivia Bot", subject:"Geography", question:"What is the name of the strait between the Atlantic and Pacific Oceans at the southern tip of South America?", answer:"strait of magellan", alts:["magellan", "straits of magellan"], ts: Date.now()-DAY*444 },
   { id:"gn17", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Kenya?", answer:"nairobi", ts: Date.now()-DAY*443 },
-  { id:"gn18", author:"Trivia Bot", subject:"Geography", question:"What two continents does the country of Russia span?", answer:"europe and asia", crewNote:"Both continents required, matey!", ts: Date.now()-DAY*442 },
+  { id:"gn18", author:"Trivia Bot", subject:"Geography", question:"What two continents does the country of Russia span?", answer:"europe and asia", crewNote:"Both continents required, matey!", alts:["eurasia"], ts: Date.now()-DAY*442 },
   { id:"gn19", author:"Trivia Bot", subject:"Geography", question:"What is the capital of Saudi Arabia?", answer:"riyadh", ts: Date.now()-DAY*441 },
   { id:"gn20", author:"Trivia Bot", subject:"Geography", question:"What is the name of the mountain range running through the center of Italy?", answer:"apennines", ts: Date.now()-DAY*440 },
 
@@ -576,8 +845,8 @@ const SEED = [
   { id:"pn10", author:"Trivia Bot", subject:"Pop Culture", question:"What TV show features the fictional Westeros?", answer:"game of thrones", ts: Date.now()-DAY*430 },
   { id:"pn11", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of Tony Stark's AI assistant in the Iron Man films?", answer:"jarvis", ts: Date.now()-DAY*429 },
   { id:"pn12", author:"Trivia Bot", subject:"Pop Culture", question:"What actress played Scarlett O'Hara in Gone with the Wind?", answer:"vivien leigh", crewNote:"Full name required, matey!", ts: Date.now()-DAY*428 },
-  { id:"pn13", author:"Trivia Bot", subject:"Pop Culture", question:"What video game franchise features characters Link and Zelda?", answer:"the legend of zelda", ts: Date.now()-DAY*427 },
-  { id:"pn14", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of the bar in The Simpsons?", answer:"moes tavern", ts: Date.now()-DAY*426 },
+  { id:"pn13", author:"Trivia Bot", subject:"Pop Culture", question:"What video game franchise features characters Link and Zelda?", answer:"the legend of zelda", alts:["zelda", "legend of zelda"], ts: Date.now()-DAY*427 },
+  { id:"pn14", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of the bar in The Simpsons?", answer:"moes tavern", alts:["moes", "moe's"], ts: Date.now()-DAY*426 },
   { id:"pn15", author:"Trivia Bot", subject:"Pop Culture", question:"Who played the Terminator in the 1984 film?", answer:"arnold schwarzenegger", crewNote:"Full name required, matey!", ts: Date.now()-DAY*425 },
   { id:"pn16", author:"Trivia Bot", subject:"Pop Culture", question:"What 1975 film by Steven Spielberg is considered the first summer blockbuster?", answer:"jaws", ts: Date.now()-DAY*424 },
   { id:"pn19", author:"Trivia Bot", subject:"Pop Culture", question:"Who played Forrest Gump's love interest Jenny in the 1994 film?", answer:"robin wright", crewNote:"Full name required, matey!", ts: Date.now()-DAY*421 },
@@ -596,16 +865,16 @@ const SEED = [
   { id:"spn13", author:"Trivia Bot", subject:"Sports", question:"How many times has Brazil won the FIFA World Cup?", answer:"5", ts: Date.now()-DAY*407 },
   { id:"spn14", author:"Trivia Bot", subject:"Sports", question:"What sport uses a shuttlecock?", answer:"badminton", ts: Date.now()-DAY*406 },
   { id:"spn15", author:"Trivia Bot", subject:"Sports", question:"What is the name of the home stadium of the Dallas Cowboys?", answer:"at&t stadium", ts: Date.now()-DAY*405 },
-  { id:"spn17", author:"Trivia Bot", subject:"Sports", question:"What is the name given to a score of three under par on a single hole in golf?", answer:"albatross", ts: Date.now()-DAY*403 },
+  { id:"spn17", author:"Trivia Bot", subject:"Sports", question:"What is the name given to a score of three under par on a single hole in golf?", answer:"albatross", alts:["double eagle"], ts: Date.now()-DAY*403 },
   { id:"spn18", author:"Trivia Bot", subject:"Sports", question:"What country hosted the 2022 FIFA World Cup?", answer:"qatar", ts: Date.now()-DAY*402 },
   { id:"spn19", author:"Trivia Bot", subject:"Sports", question:"How many players are on each team in a game of ice hockey?", answer:"6", ts: Date.now()-DAY*401 },
-  { id:"spn20", author:"Trivia Bot", subject:"Sports", question:"What is the name of the starting position in American football who snaps the ball?", answer:"center", ts: Date.now()-DAY*400 },
+  { id:"spn20", author:"Trivia Bot", subject:"Sports", question:"What is the name of the starting position in American football who snaps the ball?", answer:"center", alts:["centre"], ts: Date.now()-DAY*400 },
 
   // ── Literature — new batch (20) ───────────────────────────────────────────
   { id:"ln01", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Wuthering Heights?", answer:"emily bronte", crewNote:"Full name required, matey!", ts: Date.now()-DAY*399 },
   { id:"ln02", author:"Trivia Bot", subject:"Literature", question:"What novel by George Orwell features the pigs Napoleon and Snowball?", answer:"animal farm", ts: Date.now()-DAY*398 },
   { id:"ln03", author:"Trivia Bot", subject:"Literature", question:"Who wrote the play Othello?", answer:"william shakespeare", crewNote:"Full name required, matey!", ts: Date.now()-DAY*397 },
-  { id:"ln04", author:"Trivia Bot", subject:"Literature", question:"What is the name of the narrator in The Great Gatsby?", answer:"nick carraway", crewNote:"Full name required, matey!", ts: Date.now()-DAY*396 },
+  { id:"ln04", author:"Trivia Bot", subject:"Literature", question:"What is the name of the narrator in The Great Gatsby?", answer:"nick carraway", crewNote:"Full name required, matey!", alts:["carraway"], ts: Date.now()-DAY*396 },
   { id:"ln05", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel One Hundred Years of Solitude?", answer:"gabriel garcia marquez", crewNote:"Full name required, matey!", ts: Date.now()-DAY*395 },
   { id:"ln07", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel The Old Man and the Sea?", answer:"ernest hemingway", crewNote:"Full name required, matey!", ts: Date.now()-DAY*393 },
   { id:"ln09", author:"Trivia Bot", subject:"Literature", question:"Who wrote the play The Importance of Being Earnest?", answer:"oscar wilde", crewNote:"Full name required, matey!", ts: Date.now()-DAY*391 },
@@ -616,7 +885,7 @@ const SEED = [
   { id:"ln14", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Catch-22?", answer:"joseph heller", crewNote:"Full name required, matey!", ts: Date.now()-DAY*386 },
   { id:"ln15", author:"Trivia Bot", subject:"Literature", question:"What is the name of Sherlock Holmes's housekeeper?", answer:"mrs hudson", ts: Date.now()-DAY*385 },
   { id:"ln16", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel The Picture of Dorian Gray?", answer:"oscar wilde", crewNote:"Full name required, matey!", ts: Date.now()-DAY*384 },
-  { id:"ln17", author:"Trivia Bot", subject:"Literature", question:"What dystopian novel features the concept of Big Brother?", answer:"1984", ts: Date.now()-DAY*383 },
+  { id:"ln17", author:"Trivia Bot", subject:"Literature", question:"What dystopian novel features the concept of Big Brother?", answer:"1984", alts:["nineteen eighty four"], ts: Date.now()-DAY*383 },
   { id:"ln18", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Dracula published in 1897?", answer:"bram stoker", crewNote:"Full name required, matey!", ts: Date.now()-DAY*382 },
   { id:"ln19", author:"Trivia Bot", subject:"Literature", question:"What is the name of Robinson Crusoe's companion on the island?", answer:"friday", ts: Date.now()-DAY*381 },
   { id:"ln20", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel The Hitchhiker's Guide to the Galaxy?", answer:"douglas adams", crewNote:"Full name required, matey!", ts: Date.now()-DAY*380 },
@@ -627,38 +896,38 @@ const SEED = [
   { id:"mun04", author:"Trivia Bot", subject:"Music", question:"What is the term for a musical piece composed for two performers?", answer:"duet", ts: Date.now()-DAY*376 },
   { id:"mun05", author:"Trivia Bot", subject:"Music", question:"Who composed the symphony known as the Pastoral which is his Sixth Symphony?", answer:"beethoven", ts: Date.now()-DAY*375 },
   { id:"mun06", author:"Trivia Bot", subject:"Music", question:"What is the name of the lead singer of Radiohead?", answer:"thom yorke", crewNote:"Full name required, matey!", ts: Date.now()-DAY*374 },
-  { id:"mun07", author:"Trivia Bot", subject:"Music", question:"What musical term means gradually getting softer?", answer:"decrescendo", ts: Date.now()-DAY*373 },
+  { id:"mun07", author:"Trivia Bot", subject:"Music", question:"What musical term means gradually getting softer?", answer:"decrescendo", alts:["diminuendo"], ts: Date.now()-DAY*373 },
   { id:"mun08", author:"Trivia Bot", subject:"Music", question:"What band released the album Rumours in 1977?", answer:"fleetwood mac", ts: Date.now()-DAY*372 },
   { id:"mun09", author:"Trivia Bot", subject:"Music", question:"What is the name of the highest female singing voice?", answer:"soprano", ts: Date.now()-DAY*371 },
   { id:"mun10", author:"Trivia Bot", subject:"Music", question:"What nationality was the composer Frederic Chopin?", answer:"polish", ts: Date.now()-DAY*370 },
   { id:"mun11", author:"Trivia Bot", subject:"Music", question:"What is the name of the instrument that Elvis Presley famously played?", answer:"guitar", ts: Date.now()-DAY*369 },
   { id:"mun12", author:"Trivia Bot", subject:"Music", question:"How many strings does a standard violin have?", answer:"4", ts: Date.now()-DAY*368 },
-  { id:"mun13", author:"Trivia Bot", subject:"Music", question:"What band released the album Led Zeppelin IV which features the song Stairway to Heaven?", answer:"led zeppelin", ts: Date.now()-DAY*367 },
+  { id:"mun13", author:"Trivia Bot", subject:"Music", question:"What band released the album Led Zeppelin IV which features the song Stairway to Heaven?", answer:"led zeppelin", alts:["zeppelin"], ts: Date.now()-DAY*367 },
   { id:"mun14", author:"Trivia Bot", subject:"Music", question:"What is the name of the musical notation symbol that indicates a note should be held longer?", answer:"fermata", ts: Date.now()-DAY*366 },
   { id:"mun15", author:"Trivia Bot", subject:"Music", question:"What Austrian composer wrote The Marriage of Figaro and Don Giovanni?", answer:"mozart", ts: Date.now()-DAY*365 },
   { id:"mun16", author:"Trivia Bot", subject:"Music", question:"What is the name of the lead singer of the band The Doors?", answer:"jim morrison", crewNote:"Full name required, matey!", ts: Date.now()-DAY*364 },
-  { id:"mun17", author:"Trivia Bot", subject:"Music", question:"What decade did punk rock music emerge?", answer:"1970s", ts: Date.now()-DAY*363 },
+  { id:"mun17", author:"Trivia Bot", subject:"Music", question:"What decade did punk rock music emerge?", answer:"1970s", alts:["70s", "seventies", "the seventies", "the 70s"], ts: Date.now()-DAY*363 },
   { id:"mun19", author:"Trivia Bot", subject:"Music", question:"Who is known as the Father of the Blues?", answer:"w c handy", crewNote:"Full name required, matey!", ts: Date.now()-DAY*361 },
   { id:"mun20", author:"Trivia Bot", subject:"Music", question:"Which singer released the 1971 album What's Going On?", answer:"marvin gaye", crewNote:"Full name required, matey!", ts: Date.now()-DAY*360 },
 
   // ── Finance & Stock Market — new batch (20) ───────────────────────────────
   { id:"fin02", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Amazon?", answer:"amzn", crewNote:"Stock ticker symbol required, matey!", ts: Date.now()-DAY*358 },
   { id:"fin03", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Microsoft?", answer:"msft", crewNote:"Stock ticker symbol required, matey!", ts: Date.now()-DAY*357 },
-  { id:"fin05", author:"Trivia Bot", subject:"Finance", question:"What is the name of the investment strategy of regularly investing a fixed amount regardless of price?", answer:"dollar cost averaging", ts: Date.now()-DAY*355 },
-  { id:"fin07", author:"Trivia Bot", subject:"Finance", question:"What is the name of the US government bond with a maturity of 10 years?", answer:"treasury note", ts: Date.now()-DAY*353 },
+  { id:"fin05", author:"Trivia Bot", subject:"Finance", question:"What is the name of the investment strategy of regularly investing a fixed amount regardless of price?", answer:"dollar cost averaging", alts:["dca"], ts: Date.now()-DAY*355 },
+  { id:"fin07", author:"Trivia Bot", subject:"Finance", question:"What is the name of the US government bond with a maturity of 10 years?", answer:"treasury note", alts:["t note", "treasury notes"], ts: Date.now()-DAY*353 },
   { id:"fin09", author:"Trivia Bot", subject:"Finance", question:"What does the acronym REIT stand for?", answer:"real estate investment trust", ts: Date.now()-DAY*351 },
   { id:"fin10", author:"Trivia Bot", subject:"Finance", question:"What is the term for the gradual increase in prices over time?", answer:"inflation", ts: Date.now()-DAY*350 },
-  { id:"fin11", author:"Trivia Bot", subject:"Finance", question:"What is the name of the financial statement that shows a company's revenues and expenses?", answer:"income statement", ts: Date.now()-DAY*349 },
+  { id:"fin11", author:"Trivia Bot", subject:"Finance", question:"What is the name of the financial statement that shows a company's revenues and expenses?", answer:"income statement", alts:["profit and loss statement", "p&l", "profit and loss"], ts: Date.now()-DAY*349 },
   { id:"fin14", author:"Trivia Bot", subject:"Finance", question:"What is the maximum amount the FDIC insures per depositor per bank as of 2024?", answer:"250000", crewNote:"Dollar amount in numbers, matey!", ts: Date.now()-DAY*346 },
   { id:"fin16", author:"Trivia Bot", subject:"Finance", question:"What is the name of the index that tracks the 100 largest non-financial companies on the Nasdaq?", answer:"nasdaq 100", ts: Date.now()-DAY*344 },
-  { id:"fin17", author:"Trivia Bot", subject:"Finance", question:"What is the term for the interest rate at which banks lend money to each other overnight?", answer:"federal funds rate", ts: Date.now()-DAY*343 },
+  { id:"fin17", author:"Trivia Bot", subject:"Finance", question:"What is the term for the interest rate at which banks lend money to each other overnight?", answer:"federal funds rate", alts:["fed funds rate", "federal funds"], ts: Date.now()-DAY*343 },
 
   // ── Technology — new batch (20) ───────────────────────────────────────────
   { id:"tn01", author:"Trivia Bot", subject:"Technology", question:"What does the acronym HTTP stand for?", answer:"hypertext transfer protocol", ts: Date.now()-DAY*339 },
-  { id:"tn03", author:"Trivia Bot", subject:"Technology", question:"What company created the Java programming language?", answer:"sun microsystems", ts: Date.now()-DAY*337 },
+  { id:"tn03", author:"Trivia Bot", subject:"Technology", question:"What company created the Java programming language?", answer:"sun microsystems", alts:["sun"], ts: Date.now()-DAY*337 },
   { id:"tn05", author:"Trivia Bot", subject:"Technology", question:"What is the name of the operating system developed by Linus Torvalds in 1991?", answer:"linux", ts: Date.now()-DAY*335 },
   { id:"tn06", author:"Trivia Bot", subject:"Technology", question:"What does PDF stand for?", answer:"portable document format", ts: Date.now()-DAY*334 },
-  { id:"tn10", author:"Trivia Bot", subject:"Technology", question:"What is the name of Apple's desktop operating system?", answer:"macos", ts: Date.now()-DAY*330 },
+  { id:"tn10", author:"Trivia Bot", subject:"Technology", question:"What is the name of Apple's desktop operating system?", answer:"macos", alts:["os x", "mac os x"], ts: Date.now()-DAY*330 },
   { id:"tn11", author:"Trivia Bot", subject:"Technology", question:"What does the acronym SQL stand for?", answer:"structured query language", ts: Date.now()-DAY*329 },
   { id:"tn12", author:"Trivia Bot", subject:"Technology", question:"What is the name of the technology that allows devices to communicate wirelessly over short distances?", answer:"bluetooth", ts: Date.now()-DAY*328 },
   { id:"tn13", author:"Trivia Bot", subject:"Technology", question:"Who invented the World Wide Web in 1989?", answer:"tim berners-lee", crewNote:"Full name required, matey!", ts: Date.now()-DAY*327 },
@@ -666,7 +935,7 @@ const SEED = [
   { id:"tn15", author:"Trivia Bot", subject:"Technology", question:"What is the name of Google's web browser?", answer:"chrome", ts: Date.now()-DAY*325 },
   { id:"tn16", author:"Trivia Bot", subject:"Technology", question:"What company created the PlayStation gaming console?", answer:"sony", ts: Date.now()-DAY*324 },
   { id:"tn17", author:"Trivia Bot", subject:"Technology", question:"What does VPN stand for?", answer:"virtual private network", ts: Date.now()-DAY*323 },
-  { id:"tn18", author:"Trivia Bot", subject:"Technology", question:"What is the name of the Microsoft productivity suite that includes Word Excel and PowerPoint?", answer:"microsoft office", ts: Date.now()-DAY*322 },
+  { id:"tn18", author:"Trivia Bot", subject:"Technology", question:"What is the name of the Microsoft productivity suite that includes Word Excel and PowerPoint?", answer:"microsoft office", alts:["office", "ms office"], ts: Date.now()-DAY*322 },
 
   // ── Food & Drink — new batch (20) ────────────────────────────────────────
   { id:"fdn01", author:"Trivia Bot", subject:"Food & Drink", question:"What country is the origin of the dish paella?", answer:"spain", ts: Date.now()-DAY*319 },
@@ -682,11 +951,11 @@ const SEED = [
   { id:"fdn12", author:"Trivia Bot", subject:"Food & Drink", question:"What is the term for a dish cooked slowly in liquid in a covered pot?", answer:"braise", ts: Date.now()-DAY*308 },
   { id:"fdn13", author:"Trivia Bot", subject:"Food & Drink", question:"What country is the origin of the dish kimchi?", answer:"korea", ts: Date.now()-DAY*307 },
   { id:"fdn14", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the creamy Italian dessert made with mascarpone and espresso?", answer:"tiramisu", ts: Date.now()-DAY*306 },
-  { id:"fdn15", author:"Trivia Bot", subject:"Food & Drink", question:"What grain is used to make bourbon whiskey?", answer:"corn", ts: Date.now()-DAY*305 },
+  { id:"fdn15", author:"Trivia Bot", subject:"Food & Drink", question:"What grain is used to make bourbon whiskey?", answer:"corn", alts:["maize"], ts: Date.now()-DAY*305 },
   { id:"fdn16", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the French sauce made from egg yolks butter and lemon juice?", answer:"hollandaise", ts: Date.now()-DAY*304 },
   { id:"fdn18", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the Italian bread that is flat and topped with olive oil and herbs?", answer:"focaccia", ts: Date.now()-DAY*302 },
   { id:"fdn19", author:"Trivia Bot", subject:"Food & Drink", question:"What is the main alcoholic ingredient in a margarita?", answer:"tequila", ts: Date.now()-DAY*301 },
-  { id:"fdn20", author:"Trivia Bot", subject:"Food & Drink", question:"What type of bean is used to make chocolate?", answer:"cacao", ts: Date.now()-DAY*300 },
+  { id:"fdn20", author:"Trivia Bot", subject:"Food & Drink", question:"What type of bean is used to make chocolate?", answer:"cacao", alts:["cocoa", "cocoa bean", "cocoa beans"], ts: Date.now()-DAY*300 },
 
   // ── Art — new batch (20) ──────────────────────────────────────────────────
   { id:"an01", author:"Trivia Bot", subject:"Art", question:"What art movement was Salvador Dali associated with?", answer:"surrealism", ts: Date.now()-DAY*299 },
@@ -721,8 +990,8 @@ const SEED = [
   { id:"b3sci013", author:"Trivia Bot", subject:"Science", question:"What is the boiling point of water in degrees Fahrenheit?", answer:"212", ts: Date.now()-DAY*988 },
   { id:"b3sci014", author:"Trivia Bot", subject:"Science", question:"What term describes an animal that eats both plants and meat?", answer:"omnivore", ts: Date.now()-DAY*987 },
   { id:"b3sci015", author:"Trivia Bot", subject:"Science", question:"What term describes an animal that is active mainly at night?", answer:"nocturnal", ts: Date.now()-DAY*986 },
-  { id:"b3sci016", author:"Trivia Bot", subject:"Science", question:"What type of blood vessel carries blood away from the heart?", answer:"artery", ts: Date.now()-DAY*985 },
-  { id:"b3sci017", author:"Trivia Bot", subject:"Science", question:"What is the name of the nearest large spiral galaxy to the Milky Way?", answer:"andromeda", ts: Date.now()-DAY*984 },
+  { id:"b3sci016", author:"Trivia Bot", subject:"Science", question:"What type of blood vessel carries blood away from the heart?", answer:"artery", alts:["arteries"], ts: Date.now()-DAY*985 },
+  { id:"b3sci017", author:"Trivia Bot", subject:"Science", question:"What is the name of the nearest large spiral galaxy to the Milky Way?", answer:"andromeda", alts:["andromeda galaxy", "m31"], ts: Date.now()-DAY*984 },
   { id:"b3sci018", author:"Trivia Bot", subject:"Science", question:"What scale was traditionally used to measure earthquake magnitude?", answer:"richter", ts: Date.now()-DAY*983 },
   { id:"b3sci019", author:"Trivia Bot", subject:"Science", question:"What scale ranks mineral hardness from 1 to 10?", answer:"mohs", ts: Date.now()-DAY*982 },
   { id:"b3sci020", author:"Trivia Bot", subject:"Science", question:"What is the SI unit of force?", answer:"newton", ts: Date.now()-DAY*981 },
@@ -733,8 +1002,8 @@ const SEED = [
   { id:"b3sci025", author:"Trivia Bot", subject:"Science", question:"What is the study of weather called?", answer:"meteorology", ts: Date.now()-DAY*976 },
   { id:"b3sci026", author:"Trivia Bot", subject:"Science", question:"What is the process by which plants release water vapor through their leaves?", answer:"transpiration", ts: Date.now()-DAY*975 },
   { id:"b3sci027", author:"Trivia Bot", subject:"Science", question:"What antibiotic did Alexander Fleming discover in 1928?", answer:"penicillin", ts: Date.now()-DAY*974 },
-  { id:"b3sci028", author:"Trivia Bot", subject:"Science", question:"What type of blood cell helps the body fight infection?", answer:"white blood cell", ts: Date.now()-DAY*973 },
-  { id:"b3sci029", author:"Trivia Bot", subject:"Science", question:"What is the name of the giant storm on Jupiter that has raged for centuries?", answer:"great red spot", ts: Date.now()-DAY*972 },
+  { id:"b3sci028", author:"Trivia Bot", subject:"Science", question:"What type of blood cell helps the body fight infection?", answer:"white blood cell", alts:["leukocyte", "wbc"], ts: Date.now()-DAY*973 },
+  { id:"b3sci029", author:"Trivia Bot", subject:"Science", question:"What is the name of the giant storm on Jupiter that has raged for centuries?", answer:"great red spot", alts:["red spot", "jupiters red spot"], ts: Date.now()-DAY*972 },
   { id:"b3sci030", author:"Trivia Bot", subject:"Science", question:"What is the atomic number of oxygen?", answer:"8", ts: Date.now()-DAY*971 },
   { id:"b3sci031", author:"Trivia Bot", subject:"Science", question:"What is the atomic number of gold?", answer:"79", ts: Date.now()-DAY*970 },
   { id:"b3sci032", author:"Trivia Bot", subject:"Science", question:"What was the name of the supercontinent that existed about 300 million years ago?", answer:"pangaea", ts: Date.now()-DAY*969 },
@@ -742,8 +1011,8 @@ const SEED = [
   { id:"b3sci034", author:"Trivia Bot", subject:"Science", question:"What is the pH of pure water at room temperature?", answer:"7", ts: Date.now()-DAY*967 },
   { id:"b3sci035", author:"Trivia Bot", subject:"Science", question:"What is the name for the explosion of a massive dying star?", answer:"supernova", ts: Date.now()-DAY*966 },
   { id:"b3sci036", author:"Trivia Bot", subject:"Science", question:"What is the process of cell division that produces two identical cells?", answer:"mitosis", ts: Date.now()-DAY*965 },
-  { id:"b3sci037", author:"Trivia Bot", subject:"Science", question:"What molecule carries genetic information in most living organisms?", answer:"dna", ts: Date.now()-DAY*964 },
-  { id:"b3sci038", author:"Trivia Bot", subject:"Science", question:"What vitamin prevents scurvy?", answer:"vitamin c", ts: Date.now()-DAY*963 },
+  { id:"b3sci037", author:"Trivia Bot", subject:"Science", question:"What molecule carries genetic information in most living organisms?", answer:"dna", alts:["deoxyribonucleic acid"], ts: Date.now()-DAY*964 },
+  { id:"b3sci038", author:"Trivia Bot", subject:"Science", question:"What vitamin prevents scurvy?", answer:"vitamin c", alts:["c", "ascorbic acid"], ts: Date.now()-DAY*963 },
   { id:"b3sci039", author:"Trivia Bot", subject:"Science", question:"What unit is used to measure sound intensity?", answer:"decibel", ts: Date.now()-DAY*962 },
   { id:"b3sci040", author:"Trivia Bot", subject:"Science", question:"What is the largest moon of Saturn?", answer:"titan", ts: Date.now()-DAY*961 },
   { id:"b3sci041", author:"Trivia Bot", subject:"Science", question:"What is the largest moon of Jupiter?", answer:"ganymede", ts: Date.now()-DAY*960 },
@@ -764,8 +1033,8 @@ const SEED = [
   { id:"b3his013", author:"Trivia Bot", subject:"History", question:"What was the name of the German air force in World War II?", answer:"luftwaffe", ts: Date.now()-DAY*945 },
   { id:"b3his014", author:"Trivia Bot", subject:"History", question:"In what year did the Cuban Missile Crisis take place?", answer:"1962", ts: Date.now()-DAY*944 },
   { id:"b3his015", author:"Trivia Bot", subject:"History", question:"What was the code name of the first atomic bomb test in 1945?", answer:"trinity", ts: Date.now()-DAY*943 },
-  { id:"b3his016", author:"Trivia Bot", subject:"History", question:"What was the capital of the Byzantine Empire?", answer:"constantinople", ts: Date.now()-DAY*942 },
-  { id:"b3his017", author:"Trivia Bot", subject:"History", question:"Which pharaoh's tomb was discovered by Howard Carter in 1922?", answer:"tutankhamun", ts: Date.now()-DAY*941 },
+  { id:"b3his016", author:"Trivia Bot", subject:"History", question:"What was the capital of the Byzantine Empire?", answer:"constantinople", alts:["istanbul", "byzantium"], ts: Date.now()-DAY*942 },
+  { id:"b3his017", author:"Trivia Bot", subject:"History", question:"Which pharaoh's tomb was discovered by Howard Carter in 1922?", answer:"tutankhamun", alts:["king tut", "tut", "tutankhamen", "tutankhamon"], ts: Date.now()-DAY*941 },
   { id:"b3his018", author:"Trivia Bot", subject:"History", question:"In what year did the Western Roman Empire fall?", answer:"476", ts: Date.now()-DAY*940 },
   { id:"b3his019", author:"Trivia Bot", subject:"History", question:"Who was the first human to travel into space?", answer:"yuri gagarin", crewNote:"Full name required, matey!", ts: Date.now()-DAY*939 },
   { id:"b3his020", author:"Trivia Bot", subject:"History", question:"Who was the second person to walk on the moon?", answer:"buzz aldrin", crewNote:"Full name required, matey!", ts: Date.now()-DAY*938 },
@@ -790,7 +1059,7 @@ const SEED = [
   { id:"b3his039", author:"Trivia Bot", subject:"History", question:"Which French king was known as the Sun King?", answer:"louis xiv", crewNote:"Include the numeral, matey!", ts: Date.now()-DAY*919 },
   { id:"b3his040", author:"Trivia Bot", subject:"History", question:"Which city hosted the first modern Olympic Games in 1896?", answer:"athens", ts: Date.now()-DAY*918 },
   { id:"b3his041", author:"Trivia Bot", subject:"History", question:"What name, meaning rebirth, is given to the European cultural movement of the 14th to 17th centuries?", answer:"renaissance", ts: Date.now()-DAY*917 },
-  { id:"b3his042", author:"Trivia Bot", subject:"History", question:"What was the 1918 influenza pandemic commonly called?", answer:"spanish flu", ts: Date.now()-DAY*916 },
+  { id:"b3his042", author:"Trivia Bot", subject:"History", question:"What was the 1918 influenza pandemic commonly called?", answer:"spanish flu", alts:["spanish influenza", "1918 flu", "1918 influenza"], ts: Date.now()-DAY*916 },
   { id:"b3his043", author:"Trivia Bot", subject:"History", question:"The 1982 Falklands War was fought between Britain and which country?", answer:"argentina", ts: Date.now()-DAY*915 },
   { id:"b3his044", author:"Trivia Bot", subject:"History", question:"Which Shoshone woman guided the Lewis and Clark expedition?", answer:"sacagawea", ts: Date.now()-DAY*914 },
   { id:"b3his045", author:"Trivia Bot", subject:"History", question:"Which Portuguese explorer sailed from Europe to India around Africa in 1498?", answer:"vasco da gama", crewNote:"Full name required, matey!", ts: Date.now()-DAY*913 },
@@ -827,19 +1096,19 @@ const SEED = [
   { id:"b3geo031", author:"Trivia Bot", subject:"Geography", question:"Which river flows through Paris?", answer:"seine", ts: Date.now()-DAY*882 },
   { id:"b3geo032", author:"Trivia Bot", subject:"Geography", question:"Which river flows through Baghdad?", answer:"tigris", ts: Date.now()-DAY*881 },
   { id:"b3geo033", author:"Trivia Bot", subject:"Geography", question:"What is the longest river in Europe?", answer:"volga", ts: Date.now()-DAY*880 },
-  { id:"b3geo034", author:"Trivia Bot", subject:"Geography", question:"What is the longest river in Asia?", answer:"yangtze", ts: Date.now()-DAY*879 },
+  { id:"b3geo034", author:"Trivia Bot", subject:"Geography", question:"What is the longest river in Asia?", answer:"yangtze", alts:["yangzi", "chang jiang", "changjiang"], ts: Date.now()-DAY*879 },
   { id:"b3geo035", author:"Trivia Bot", subject:"Geography", question:"What is the largest lake in Africa?", answer:"victoria", ts: Date.now()-DAY*878 },
   { id:"b3geo036", author:"Trivia Bot", subject:"Geography", question:"What is the highest mountain in Africa?", answer:"kilimanjaro", ts: Date.now()-DAY*877 },
-  { id:"b3geo037", author:"Trivia Bot", subject:"Geography", question:"What is the highest mountain in North America?", answer:"denali", ts: Date.now()-DAY*876 },
+  { id:"b3geo037", author:"Trivia Bot", subject:"Geography", question:"What is the highest mountain in North America?", answer:"denali", alts:["mckinley", "mount mckinley"], ts: Date.now()-DAY*876 },
   { id:"b3geo038", author:"Trivia Bot", subject:"Geography", question:"What is the largest hot desert in the world?", answer:"sahara", ts: Date.now()-DAY*875 },
-  { id:"b3geo039", author:"Trivia Bot", subject:"Geography", question:"What is the largest coral reef system in the world?", answer:"great barrier reef", ts: Date.now()-DAY*874 },
+  { id:"b3geo039", author:"Trivia Bot", subject:"Geography", question:"What is the largest coral reef system in the world?", answer:"great barrier reef", alts:["barrier reef"], ts: Date.now()-DAY*874 },
   { id:"b3geo040", author:"Trivia Bot", subject:"Geography", question:"What is the largest country in Africa by area?", answer:"algeria", ts: Date.now()-DAY*873 },
   { id:"b3geo041", author:"Trivia Bot", subject:"Geography", question:"What is the largest island in the Mediterranean Sea?", answer:"sicily", ts: Date.now()-DAY*872 },
   { id:"b3geo042", author:"Trivia Bot", subject:"Geography", question:"What is the tallest waterfall in the world?", answer:"angel falls", ts: Date.now()-DAY*871 },
   { id:"b3geo043", author:"Trivia Bot", subject:"Geography", question:"Which country is known as the Land of the Rising Sun?", answer:"japan", ts: Date.now()-DAY*870 },
   { id:"b3geo044", author:"Trivia Bot", subject:"Geography", question:"Which European country is shaped like a boot?", answer:"italy", ts: Date.now()-DAY*869 },
   { id:"b3geo045", author:"Trivia Bot", subject:"Geography", question:"In which US state is the Grand Canyon?", answer:"arizona", ts: Date.now()-DAY*868 },
-  { id:"b3geo046", author:"Trivia Bot", subject:"Geography", question:"Which river forms much of the border between Texas and Mexico?", answer:"rio grande", ts: Date.now()-DAY*867 },
+  { id:"b3geo046", author:"Trivia Bot", subject:"Geography", question:"Which river forms much of the border between Texas and Mexico?", answer:"rio grande", alts:["rio bravo"], ts: Date.now()-DAY*867 },
   { id:"b3geo047", author:"Trivia Bot", subject:"Geography", question:"Which Central American country is home to a famous canal linking the Atlantic and Pacific?", answer:"panama", ts: Date.now()-DAY*866 },
   { id:"b3geo048", author:"Trivia Bot", subject:"Geography", question:"Which sea separates southern Europe from northern Africa?", answer:"mediterranean", ts: Date.now()-DAY*865 },
   { id:"b3geo049", author:"Trivia Bot", subject:"Geography", question:"Which mountain range contains Mont Blanc?", answer:"alps", ts: Date.now()-DAY*864 },
@@ -866,11 +1135,11 @@ const SEED = [
   { id:"b3pop021", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of the green ogre in a popular DreamWorks film series?", answer:"shrek", ts: Date.now()-DAY*843 },
   { id:"b3pop022", author:"Trivia Bot", subject:"Pop Culture", question:"In which fictional town do The Simpsons live?", answer:"springfield", ts: Date.now()-DAY*842 },
   { id:"b3pop023", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of Batman's fictional home city?", answer:"gotham", ts: Date.now()-DAY*841 },
-  { id:"b3pop024", author:"Trivia Bot", subject:"Pop Culture", question:"Which sitcom features the character Sheldon Cooper?", answer:"the big bang theory", ts: Date.now()-DAY*840 },
+  { id:"b3pop024", author:"Trivia Bot", subject:"Pop Culture", question:"Which sitcom features the character Sheldon Cooper?", answer:"the big bang theory", alts:["tbbt"], ts: Date.now()-DAY*840 },
   { id:"b3pop025", author:"Trivia Bot", subject:"Pop Culture", question:"Which sitcom follows Jerry, George, Elaine, and Kramer?", answer:"seinfeld", ts: Date.now()-DAY*839 },
-  { id:"b3pop026", author:"Trivia Bot", subject:"Pop Culture", question:"Which sitcom features Ted Mosby telling his kids how he met their mother?", answer:"how i met your mother", ts: Date.now()-DAY*838 },
+  { id:"b3pop026", author:"Trivia Bot", subject:"Pop Culture", question:"Which sitcom features Ted Mosby telling his kids how he met their mother?", answer:"how i met your mother", alts:["himym"], ts: Date.now()-DAY*838 },
   { id:"b3pop027", author:"Trivia Bot", subject:"Pop Culture", question:"Which reality competition show features contestants being voted off the island?", answer:"survivor", ts: Date.now()-DAY*837 },
-  { id:"b3pop028", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of the child character in The Mandalorian?", answer:"grogu", ts: Date.now()-DAY*836 },
+  { id:"b3pop028", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of the child character in The Mandalorian?", answer:"grogu", alts:["the child", "baby yoda"], ts: Date.now()-DAY*836 },
   { id:"b3pop029", author:"Trivia Bot", subject:"Pop Culture", question:"Which actress plays Eleven in Stranger Things?", answer:"millie bobby brown", crewNote:"Full name required, matey!", ts: Date.now()-DAY*835 },
   { id:"b3pop030", author:"Trivia Bot", subject:"Pop Culture", question:"Which company created the Mario video game character?", answer:"nintendo", ts: Date.now()-DAY*834 },
   { id:"b3pop031", author:"Trivia Bot", subject:"Pop Culture", question:"What is the name of Mario's brother?", answer:"luigi", ts: Date.now()-DAY*833 },
@@ -888,7 +1157,7 @@ const SEED = [
   { id:"b3spt002", author:"Trivia Bot", subject:"Sports", question:"Which NBA team did Michael Jordan win six championships with?", answer:"bulls", crewNote:"Team nickname is fine, matey!", ts: Date.now()-DAY*821 },
   { id:"b3spt003", author:"Trivia Bot", subject:"Sports", question:"Which NFL team plays its home games at Lambeau Field?", answer:"packers", crewNote:"Team nickname is fine, matey!", ts: Date.now()-DAY*820 },
   { id:"b3spt004", author:"Trivia Bot", subject:"Sports", question:"Which MLB team is nicknamed the Bronx Bombers?", answer:"yankees", crewNote:"Team nickname is fine, matey!", ts: Date.now()-DAY*819 },
-  { id:"b3spt005", author:"Trivia Bot", subject:"Sports", question:"Which NHL franchise has won the most Stanley Cups?", answer:"canadiens", crewNote:"Team nickname is fine, matey!", ts: Date.now()-DAY*818 },
+  { id:"b3spt005", author:"Trivia Bot", subject:"Sports", question:"Which NHL franchise has won the most Stanley Cups?", answer:"canadiens", crewNote:"Team nickname is fine, matey!", alts:["habs", "montreal canadiens", "montreal"], ts: Date.now()-DAY*818 },
   { id:"b3spt006", author:"Trivia Bot", subject:"Sports", question:"Which golfer has won a record 18 major championships?", answer:"jack nicklaus", crewNote:"Full name required, matey!", ts: Date.now()-DAY*817 },
   { id:"b3spt007", author:"Trivia Bot", subject:"Sports", question:"Which country won the 2014 FIFA World Cup?", answer:"germany", ts: Date.now()-DAY*816 },
   { id:"b3spt008", author:"Trivia Bot", subject:"Sports", question:"Which country won the 2018 FIFA World Cup?", answer:"france", ts: Date.now()-DAY*815 },
@@ -908,8 +1177,8 @@ const SEED = [
   { id:"b3spt022", author:"Trivia Bot", subject:"Sports", question:"Which tennis player won a record 14 French Open titles?", answer:"rafael nadal", crewNote:"Full name required, matey!", ts: Date.now()-DAY*801 },
   { id:"b3spt023", author:"Trivia Bot", subject:"Sports", question:"Which Brazilian soccer legend is nicknamed The King of Football?", answer:"pele", ts: Date.now()-DAY*800 },
   { id:"b3spt024", author:"Trivia Bot", subject:"Sports", question:"In which sport is the Ryder Cup contested?", answer:"golf", ts: Date.now()-DAY*799 },
-  { id:"b3spt025", author:"Trivia Bot", subject:"Sports", question:"In which sport is the America's Cup contested?", answer:"sailing", ts: Date.now()-DAY*798 },
-  { id:"b3spt026", author:"Trivia Bot", subject:"Sports", question:"In which sport is the Heisman Trophy awarded?", answer:"football", ts: Date.now()-DAY*797 },
+  { id:"b3spt025", author:"Trivia Bot", subject:"Sports", question:"In which sport is the America's Cup contested?", answer:"sailing", alts:["yachting", "yacht racing"], ts: Date.now()-DAY*798 },
+  { id:"b3spt026", author:"Trivia Bot", subject:"Sports", question:"In which sport is the Heisman Trophy awarded?", answer:"football", alts:["college football", "american football", "gridiron"], ts: Date.now()-DAY*797 },
   { id:"b3spt027", author:"Trivia Bot", subject:"Sports", question:"Which gymnastics apparatus features two handles on a leather-covered body?", answer:"pommel horse", ts: Date.now()-DAY*796 },
   { id:"b3spt028", author:"Trivia Bot", subject:"Sports", question:"What is the term for three consecutive strikes in bowling?", answer:"turkey", ts: Date.now()-DAY*795 },
   { id:"b3spt029", author:"Trivia Bot", subject:"Sports", question:"What is the golf term for one stroke under par on a hole?", answer:"birdie", ts: Date.now()-DAY*794 },
@@ -920,7 +1189,7 @@ const SEED = [
   { id:"b3spt034", author:"Trivia Bot", subject:"Sports", question:"How many minutes are in a regulation NBA game?", answer:"48", ts: Date.now()-DAY*789 },
   { id:"b3spt035", author:"Trivia Bot", subject:"Sports", question:"How many yards long is an American football field between the goal lines?", answer:"100", ts: Date.now()-DAY*788 },
   { id:"b3spt036", author:"Trivia Bot", subject:"Sports", question:"How many yards must an offense gain for a first down in American football?", answer:"10", ts: Date.now()-DAY*787 },
-  { id:"b3spt037", author:"Trivia Bot", subject:"Sports", question:"Which country is the birthplace of cricket?", answer:"england", ts: Date.now()-DAY*786 },
+  { id:"b3spt037", author:"Trivia Bot", subject:"Sports", question:"Which country is the birthplace of cricket?", answer:"england", alts:["britain", "great britain", "united kingdom", "uk"], ts: Date.now()-DAY*786 },
   { id:"b3lit001", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel Jane Eyre?", answer:"charlotte bronte", crewNote:"Full name required, matey!", ts: Date.now()-DAY*785 },
   { id:"b3lit002", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Lord of the Rings?", answer:"j r r tolkien", crewNote:"Full name required, matey!", ts: Date.now()-DAY*784 },
   { id:"b3lit003", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Chronicles of Narnia?", answer:"c s lewis", crewNote:"Full name required, matey!", ts: Date.now()-DAY*783 },
@@ -933,8 +1202,8 @@ const SEED = [
   { id:"b3lit010", author:"Trivia Bot", subject:"Literature", question:"Who wrote Around the World in Eighty Days?", answer:"jules verne", crewNote:"Full name required, matey!", ts: Date.now()-DAY*776 },
   { id:"b3lit011", author:"Trivia Bot", subject:"Literature", question:"Who wrote The War of the Worlds?", answer:"h g wells", crewNote:"Full name required, matey!", ts: Date.now()-DAY*775 },
   { id:"b3lit012", author:"Trivia Bot", subject:"Literature", question:"Who wrote Treasure Island?", answer:"robert louis stevenson", crewNote:"Full name required, matey!", ts: Date.now()-DAY*774 },
-  { id:"b3lit013", author:"Trivia Bot", subject:"Literature", question:"What is the name of the one-legged pirate in Treasure Island?", answer:"long john silver", crewNote:"Full name required, matey!", ts: Date.now()-DAY*773 },
-  { id:"b3lit014", author:"Trivia Bot", subject:"Literature", question:"What is the name of the pirate captain in Peter Pan?", answer:"captain hook", crewNote:"Include the title, matey!", ts: Date.now()-DAY*772 },
+  { id:"b3lit013", author:"Trivia Bot", subject:"Literature", question:"What is the name of the one-legged pirate in Treasure Island?", answer:"long john silver", crewNote:"Full name required, matey!", alts:["silver", "john silver"], ts: Date.now()-DAY*773 },
+  { id:"b3lit014", author:"Trivia Bot", subject:"Literature", question:"What is the name of the pirate captain in Peter Pan?", answer:"captain hook", alts:["hook", "james hook"], ts: Date.now()-DAY*772 },
   { id:"b3lit015", author:"Trivia Bot", subject:"Literature", question:"Who wrote Gulliver's Travels?", answer:"jonathan swift", crewNote:"Full name required, matey!", ts: Date.now()-DAY*771 },
   { id:"b3lit016", author:"Trivia Bot", subject:"Literature", question:"Who wrote Robinson Crusoe?", answer:"daniel defoe", crewNote:"Full name required, matey!", ts: Date.now()-DAY*770 },
   { id:"b3lit017", author:"Trivia Bot", subject:"Literature", question:"Who wrote Fahrenheit 451?", answer:"ray bradbury", crewNote:"Full name required, matey!", ts: Date.now()-DAY*769 },
@@ -944,7 +1213,7 @@ const SEED = [
   { id:"b3lit021", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Color Purple?", answer:"alice walker", crewNote:"Full name required, matey!", ts: Date.now()-DAY*765 },
   { id:"b3lit022", author:"Trivia Bot", subject:"Literature", question:"Who wrote I Know Why the Caged Bird Sings?", answer:"maya angelou", crewNote:"Full name required, matey!", ts: Date.now()-DAY*764 },
   { id:"b3lit023", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Handmaid's Tale?", answer:"margaret atwood", crewNote:"Full name required, matey!", ts: Date.now()-DAY*763 },
-  { id:"b3lit024", author:"Trivia Bot", subject:"Literature", question:"Who wrote the Divine Comedy?", answer:"dante alighieri", crewNote:"Full name required, matey!", ts: Date.now()-DAY*762 },
+  { id:"b3lit024", author:"Trivia Bot", subject:"Literature", question:"Who wrote the Divine Comedy?", answer:"dante alighieri", alts:["dante"], ts: Date.now()-DAY*762 },
   { id:"b3lit025", author:"Trivia Bot", subject:"Literature", question:"Who wrote the epic poem Paradise Lost?", answer:"john milton", crewNote:"Full name required, matey!", ts: Date.now()-DAY*761 },
   { id:"b3lit026", author:"Trivia Bot", subject:"Literature", question:"Who wrote the poem The Raven?", answer:"edgar allan poe", crewNote:"Full name required, matey!", ts: Date.now()-DAY*760 },
   { id:"b3lit027", author:"Trivia Bot", subject:"Literature", question:"Who wrote the poetry collection Leaves of Grass?", answer:"walt whitman", crewNote:"Full name required, matey!", ts: Date.now()-DAY*759 },
@@ -952,21 +1221,21 @@ const SEED = [
   { id:"b3lit029", author:"Trivia Bot", subject:"Literature", question:"Which ancient Greek playwright wrote Oedipus Rex?", answer:"sophocles", ts: Date.now()-DAY*757 },
   { id:"b3lit030", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Metamorphosis?", answer:"franz kafka", crewNote:"Full name required, matey!", ts: Date.now()-DAY*756 },
   { id:"b3lit031", author:"Trivia Bot", subject:"Literature", question:"Who wrote the novel The Stranger?", answer:"albert camus", crewNote:"Full name required, matey!", ts: Date.now()-DAY*755 },
-  { id:"b3lit032", author:"Trivia Bot", subject:"Literature", question:"Who wrote Alice's Adventures in Wonderland under a pen name?", answer:"lewis carroll", crewNote:"Pen name required, matey!", ts: Date.now()-DAY*754 },
+  { id:"b3lit032", author:"Trivia Bot", subject:"Literature", question:"Who wrote Alice's Adventures in Wonderland under a pen name?", answer:"lewis carroll", crewNote:"Pen name required, matey!", alts:["charles dodgson", "charles lutwidge dodgson"], ts: Date.now()-DAY*754 },
   { id:"b3lit033", author:"Trivia Bot", subject:"Literature", question:"Who wrote Charlie and the Chocolate Factory?", answer:"roald dahl", crewNote:"Full name required, matey!", ts: Date.now()-DAY*753 },
   { id:"b3lit034", author:"Trivia Bot", subject:"Literature", question:"Who wrote Where the Wild Things Are?", answer:"maurice sendak", crewNote:"Full name required, matey!", ts: Date.now()-DAY*752 },
-  { id:"b3lit035", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Cat in the Hat under a pen name?", answer:"dr seuss", crewNote:"Pen name required, matey!", ts: Date.now()-DAY*751 },
+  { id:"b3lit035", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Cat in the Hat under a pen name?", answer:"dr seuss", crewNote:"Pen name required, matey!", alts:["theodor geisel", "theodor seuss geisel", "doctor seuss"], ts: Date.now()-DAY*751 },
   { id:"b3lit036", author:"Trivia Bot", subject:"Literature", question:"Who wrote The Giving Tree?", answer:"shel silverstein", crewNote:"Full name required, matey!", ts: Date.now()-DAY*750 },
   { id:"b3lit037", author:"Trivia Bot", subject:"Literature", question:"In which Shakespeare play does the character Prospero appear?", answer:"the tempest", ts: Date.now()-DAY*749 },
   { id:"b3lit038", author:"Trivia Bot", subject:"Literature", question:"Which Shakespeare play features Lady Macbeth?", answer:"macbeth", ts: Date.now()-DAY*748 },
-  { id:"b3mus001", author:"Trivia Bot", subject:"Music", question:"Who composed the ballet The Nutcracker?", answer:"tchaikovsky", crewNote:"Last name only, matey!", ts: Date.now()-DAY*747 },
+  { id:"b3mus001", author:"Trivia Bot", subject:"Music", question:"Who composed the ballet The Nutcracker?", answer:"tchaikovsky", crewNote:"Last name only, matey!", alts:["chaikovsky", "tschaikowsky"], ts: Date.now()-DAY*747 },
   { id:"b3mus002", author:"Trivia Bot", subject:"Music", question:"Who composed the opera Carmen?", answer:"bizet", crewNote:"Last name only, matey!", ts: Date.now()-DAY*746 },
   { id:"b3mus003", author:"Trivia Bot", subject:"Music", question:"Who composed the orchestral piece Bolero?", answer:"ravel", crewNote:"Last name only, matey!", ts: Date.now()-DAY*745 },
   { id:"b3mus004", author:"Trivia Bot", subject:"Music", question:"Who composed The Rite of Spring?", answer:"stravinsky", crewNote:"Last name only, matey!", ts: Date.now()-DAY*744 },
   { id:"b3mus005", author:"Trivia Bot", subject:"Music", question:"Who composed the Brandenburg Concertos?", answer:"bach", crewNote:"Last name only, matey!", ts: Date.now()-DAY*743 },
   { id:"b3mus006", author:"Trivia Bot", subject:"Music", question:"Who composed Clair de Lune?", answer:"debussy", crewNote:"Last name only, matey!", ts: Date.now()-DAY*742 },
   { id:"b3mus007", author:"Trivia Bot", subject:"Music", question:"Who composed Rhapsody in Blue?", answer:"george gershwin", crewNote:"Full name required, matey!", ts: Date.now()-DAY*741 },
-  { id:"b3mus008", author:"Trivia Bot", subject:"Music", question:"Who was the lead singer of The Police?", answer:"sting", ts: Date.now()-DAY*740 },
+  { id:"b3mus008", author:"Trivia Bot", subject:"Music", question:"Who was the lead singer of The Police?", answer:"sting", alts:["gordon sumner"], ts: Date.now()-DAY*740 },
   { id:"b3mus009", author:"Trivia Bot", subject:"Music", question:"Who is the lead singer of Maroon 5?", answer:"adam levine", crewNote:"Full name required, matey!", ts: Date.now()-DAY*739 },
   { id:"b3mus010", author:"Trivia Bot", subject:"Music", question:"Who is the lead singer of Aerosmith?", answer:"steven tyler", crewNote:"Full name required, matey!", ts: Date.now()-DAY*738 },
   { id:"b3mus011", author:"Trivia Bot", subject:"Music", question:"Who is the lead singer of Metallica?", answer:"james hetfield", crewNote:"Full name required, matey!", ts: Date.now()-DAY*737 },
@@ -976,11 +1245,11 @@ const SEED = [
   { id:"b3mus015", author:"Trivia Bot", subject:"Music", question:"Which singer released the 1984 album Purple Rain?", answer:"prince", ts: Date.now()-DAY*733 },
   { id:"b3mus016", author:"Trivia Bot", subject:"Music", question:"Which band recorded Hotel California?", answer:"eagles", ts: Date.now()-DAY*732 },
   { id:"b3mus017", author:"Trivia Bot", subject:"Music", question:"Which band recorded Smells Like Teen Spirit?", answer:"nirvana", ts: Date.now()-DAY*731 },
-  { id:"b3mus018", author:"Trivia Bot", subject:"Music", question:"Which band recorded Sweet Child o' Mine?", answer:"guns n roses", ts: Date.now()-DAY*730 },
+  { id:"b3mus018", author:"Trivia Bot", subject:"Music", question:"Which band recorded Sweet Child o' Mine?", answer:"guns n roses", alts:["guns and roses"], ts: Date.now()-DAY*730 },
   { id:"b3mus019", author:"Trivia Bot", subject:"Music", question:"Which Australian band recorded Back in Black in 1980?", answer:"acdc", ts: Date.now()-DAY*729 },
   { id:"b3mus020", author:"Trivia Bot", subject:"Music", question:"Which rapper's real name is Marshall Mathers?", answer:"eminem", ts: Date.now()-DAY*728 },
   { id:"b3mus021", author:"Trivia Bot", subject:"Music", question:"Which rapper's real name is Shawn Carter?", answer:"jay z", ts: Date.now()-DAY*727 },
-  { id:"b3mus022", author:"Trivia Bot", subject:"Music", question:"What is the stage name of Stefani Germanotta?", answer:"lady gaga", crewNote:"Full stage name, matey!", ts: Date.now()-DAY*726 },
+  { id:"b3mus022", author:"Trivia Bot", subject:"Music", question:"What is the stage name of Stefani Germanotta?", answer:"lady gaga", alts:["gaga"], ts: Date.now()-DAY*726 },
   { id:"b3mus023", author:"Trivia Bot", subject:"Music", question:"Which stringed instrument is also called a fiddle?", answer:"violin", ts: Date.now()-DAY*725 },
   { id:"b3mus024", author:"Trivia Bot", subject:"Music", question:"Which large triangular-framed stringed instrument is plucked and associated with angels?", answer:"harp", ts: Date.now()-DAY*724 },
   { id:"b3mus025", author:"Trivia Bot", subject:"Music", question:"Which brass instrument is played with a slide?", answer:"trombone", ts: Date.now()-DAY*723 },
@@ -1031,8 +1300,8 @@ const SEED = [
   { id:"b3tec029", author:"Trivia Bot", subject:"Technology", question:"What programming language did Apple introduce in 2014 for iOS and macOS development?", answer:"swift", ts: Date.now()-DAY*678 },
   { id:"b3tec030", author:"Trivia Bot", subject:"Technology", question:"What version control system did Linus Torvalds create?", answer:"git", ts: Date.now()-DAY*677 },
   { id:"b3tec031", author:"Trivia Bot", subject:"Technology", question:"What is the name of OpenAI's popular chatbot launched in 2022?", answer:"chatgpt", ts: Date.now()-DAY*676 },
-  { id:"b3tec032", author:"Trivia Bot", subject:"Technology", question:"What cryptocurrency was created by the pseudonymous Satoshi Nakamoto?", answer:"bitcoin", ts: Date.now()-DAY*675 },
-  { id:"b3tec033", author:"Trivia Bot", subject:"Technology", question:"What is the smallest unit of data in computing?", answer:"bit", ts: Date.now()-DAY*674 },
+  { id:"b3tec032", author:"Trivia Bot", subject:"Technology", question:"What cryptocurrency was created by the pseudonymous Satoshi Nakamoto?", answer:"bitcoin", alts:["btc"], ts: Date.now()-DAY*675 },
+  { id:"b3tec033", author:"Trivia Bot", subject:"Technology", question:"What is the smallest unit of data in computing?", answer:"bit", alts:["binary digit"], ts: Date.now()-DAY*674 },
   { id:"b3tec034", author:"Trivia Bot", subject:"Technology", question:"How many bits are in a byte?", answer:"8", ts: Date.now()-DAY*673 },
   { id:"b3fin001", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Nvidia?", answer:"nvda", crewNote:"Stock ticker symbol required, matey!", ts: Date.now()-DAY*672 },
   { id:"b3fin002", author:"Trivia Bot", subject:"Finance", question:"What is the stock ticker symbol for Meta Platforms?", answer:"meta", crewNote:"Stock ticker symbol required, matey!", ts: Date.now()-DAY*671 },
@@ -1057,15 +1326,15 @@ const SEED = [
   { id:"b3fin021", author:"Trivia Bot", subject:"Finance", question:"What does CPI stand for in economics?", answer:"consumer price index", ts: Date.now()-DAY*652 },
   { id:"b3fin022", author:"Trivia Bot", subject:"Finance", question:"What does FOMC stand for at the Federal Reserve?", answer:"federal open market committee", ts: Date.now()-DAY*651 },
   { id:"b3fin023", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Japan?", answer:"yen", ts: Date.now()-DAY*650 },
-  { id:"b3fin024", author:"Trivia Bot", subject:"Finance", question:"What currency is used by most countries in the Eurozone?", answer:"euro", ts: Date.now()-DAY*649 },
-  { id:"b3fin025", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of the United Kingdom?", answer:"pound", ts: Date.now()-DAY*648 },
-  { id:"b3fin026", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Switzerland?", answer:"franc", ts: Date.now()-DAY*647 },
-  { id:"b3fin027", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of India?", answer:"rupee", ts: Date.now()-DAY*646 },
-  { id:"b3fin028", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Mexico?", answer:"peso", ts: Date.now()-DAY*645 },
-  { id:"b3fin029", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Russia?", answer:"ruble", ts: Date.now()-DAY*644 },
-  { id:"b3fin030", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of South Korea?", answer:"won", ts: Date.now()-DAY*643 },
-  { id:"b3fin031", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Brazil?", answer:"real", ts: Date.now()-DAY*642 },
-  { id:"b3fin032", author:"Trivia Bot", subject:"Finance", question:"What is the basic unit of China's currency, the renminbi?", answer:"yuan", ts: Date.now()-DAY*641 },
+  { id:"b3fin024", author:"Trivia Bot", subject:"Finance", question:"What currency is used by most countries in the Eurozone?", answer:"euro", alts:["euros", "eur"], ts: Date.now()-DAY*649 },
+  { id:"b3fin025", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of the United Kingdom?", answer:"pound", alts:["gbp", "sterling", "pounds"], ts: Date.now()-DAY*648 },
+  { id:"b3fin026", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Switzerland?", answer:"franc", alts:["swiss franc", "chf"], ts: Date.now()-DAY*647 },
+  { id:"b3fin027", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of India?", answer:"rupee", alts:["indian rupee", "inr", "rupees"], ts: Date.now()-DAY*646 },
+  { id:"b3fin028", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Mexico?", answer:"peso", alts:["mexican peso", "pesos"], ts: Date.now()-DAY*645 },
+  { id:"b3fin029", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Russia?", answer:"ruble", alts:["rouble", "russian ruble", "rubles"], ts: Date.now()-DAY*644 },
+  { id:"b3fin030", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of South Korea?", answer:"won", alts:["korean won", "south korean won", "krw"], ts: Date.now()-DAY*643 },
+  { id:"b3fin031", author:"Trivia Bot", subject:"Finance", question:"What is the official currency of Brazil?", answer:"real", alts:["brazilian real", "reais", "brl"], ts: Date.now()-DAY*642 },
+  { id:"b3fin032", author:"Trivia Bot", subject:"Finance", question:"What is the basic unit of China's currency, the renminbi?", answer:"yuan", alts:["renminbi", "rmb", "chinese yuan"], ts: Date.now()-DAY*641 },
   { id:"b3fin033", author:"Trivia Bot", subject:"Finance", question:"Whose portrait appears on the US one-dollar bill?", answer:"george washington", crewNote:"Full name required, matey!", ts: Date.now()-DAY*640 },
   { id:"b3fin034", author:"Trivia Bot", subject:"Finance", question:"Whose portrait appears on the US five-dollar bill?", answer:"abraham lincoln", crewNote:"Full name required, matey!", ts: Date.now()-DAY*639 },
   { id:"b3fin035", author:"Trivia Bot", subject:"Finance", question:"Whose portrait appears on the US ten-dollar bill?", answer:"alexander hamilton", crewNote:"Full name required, matey!", ts: Date.now()-DAY*638 },
@@ -1077,32 +1346,32 @@ const SEED = [
   { id:"b3fin041", author:"Trivia Bot", subject:"Finance", question:"What is the name of the New York street that is the heart of the US financial district?", answer:"wall street", ts: Date.now()-DAY*632 },
   { id:"b3fod001", author:"Trivia Bot", subject:"Food & Drink", question:"What cheese is traditionally used on a Margherita pizza?", answer:"mozzarella", ts: Date.now()-DAY*631 },
   { id:"b3fod002", author:"Trivia Bot", subject:"Food & Drink", question:"What is the main ingredient in traditional pesto sauce?", answer:"basil", ts: Date.now()-DAY*630 },
-  { id:"b3fod003", author:"Trivia Bot", subject:"Food & Drink", question:"What Italian hard cheese is named after the city of Parma?", answer:"parmesan", ts: Date.now()-DAY*629 },
+  { id:"b3fod003", author:"Trivia Bot", subject:"Food & Drink", question:"What Italian hard cheese is named after the city of Parma?", answer:"parmesan", alts:["parmigiano reggiano", "parmigiano", "parmegiano"], ts: Date.now()-DAY*629 },
   { id:"b3fod004", author:"Trivia Bot", subject:"Food & Drink", question:"What fruit is a key ingredient in a classic Waldorf salad?", answer:"apple", ts: Date.now()-DAY*628 },
-  { id:"b3fod005", author:"Trivia Bot", subject:"Food & Drink", question:"What is tofu made from?", answer:"soybeans", ts: Date.now()-DAY*627 },
+  { id:"b3fod005", author:"Trivia Bot", subject:"Food & Drink", question:"What is tofu made from?", answer:"soybeans", alts:["soy", "soy beans", "soya beans", "soybean", "soya"], ts: Date.now()-DAY*627 },
   { id:"b3fod006", author:"Trivia Bot", subject:"Food & Drink", question:"What is the national dish of Scotland, made from sheep offal?", answer:"haggis", ts: Date.now()-DAY*626 },
   { id:"b3fod007", author:"Trivia Bot", subject:"Food & Drink", question:"What leafy green is the main ingredient in saag paneer?", answer:"spinach", ts: Date.now()-DAY*625 },
   { id:"b3fod008", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the cold Spanish tomato soup?", answer:"gazpacho", ts: Date.now()-DAY*624 },
   { id:"b3fod009", author:"Trivia Bot", subject:"Food & Drink", question:"What French dish is a stewed vegetable medley from Provence?", answer:"ratatouille", ts: Date.now()-DAY*623 },
-  { id:"b3fod010", author:"Trivia Bot", subject:"Food & Drink", question:"What is the traditional braided Jewish bread called?", answer:"challah", ts: Date.now()-DAY*622 },
+  { id:"b3fod010", author:"Trivia Bot", subject:"Food & Drink", question:"What is the traditional braided Jewish bread called?", answer:"challah", alts:["hallah", "challa"], ts: Date.now()-DAY*622 },
   { id:"b3fod011", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the Indian flatbread traditionally baked in a tandoor?", answer:"naan", ts: Date.now()-DAY*621 },
   { id:"b3fod012", author:"Trivia Bot", subject:"Food & Drink", question:"What Japanese noodle soup is often topped with pork and a soft-boiled egg?", answer:"ramen", ts: Date.now()-DAY*620 },
-  { id:"b3fod013", author:"Trivia Bot", subject:"Food & Drink", question:"What dairy product is the main ingredient in tzatziki?", answer:"yogurt", ts: Date.now()-DAY*619 },
+  { id:"b3fod013", author:"Trivia Bot", subject:"Food & Drink", question:"What dairy product is the main ingredient in tzatziki?", answer:"yogurt", alts:["yoghurt", "greek yogurt"], ts: Date.now()-DAY*619 },
   { id:"b3fod014", author:"Trivia Bot", subject:"Food & Drink", question:"What Italian dessert's name means cooked cream?", answer:"panna cotta", ts: Date.now()-DAY*618 },
   { id:"b3fod015", author:"Trivia Bot", subject:"Food & Drink", question:"What is Italian-style ice cream called?", answer:"gelato", ts: Date.now()-DAY*617 },
-  { id:"b3fod016", author:"Trivia Bot", subject:"Food & Drink", question:"What spirit is the base of a mojito?", answer:"rum", ts: Date.now()-DAY*616 },
+  { id:"b3fod016", author:"Trivia Bot", subject:"Food & Drink", question:"What spirit is the base of a mojito?", answer:"rum", alts:["white rum", "light rum"], ts: Date.now()-DAY*616 },
   { id:"b3fod017", author:"Trivia Bot", subject:"Food & Drink", question:"What spirit is the base of a Moscow Mule?", answer:"vodka", ts: Date.now()-DAY*615 },
   { id:"b3fod018", author:"Trivia Bot", subject:"Food & Drink", question:"What fermented tea drink is made using a SCOBY?", answer:"kombucha", ts: Date.now()-DAY*614 },
-  { id:"b3fod019", author:"Trivia Bot", subject:"Food & Drink", question:"What finely ground green tea powder is used in Japanese tea ceremonies?", answer:"matcha", ts: Date.now()-DAY*613 },
+  { id:"b3fod019", author:"Trivia Bot", subject:"Food & Drink", question:"What finely ground green tea powder is used in Japanese tea ceremonies?", answer:"matcha", alts:["maccha"], ts: Date.now()-DAY*613 },
   { id:"b3fod020", author:"Trivia Bot", subject:"Food & Drink", question:"What fruit is a prune dried from?", answer:"plum", ts: Date.now()-DAY*612 },
-  { id:"b3fod021", author:"Trivia Bot", subject:"Food & Drink", question:"What nut is traditionally used in pesto?", answer:"pine nut", ts: Date.now()-DAY*611 },
+  { id:"b3fod021", author:"Trivia Bot", subject:"Food & Drink", question:"What nut is traditionally used in pesto?", answer:"pine nut", alts:["pine nuts", "pignoli", "pinoli"], ts: Date.now()-DAY*611 },
   { id:"b3fod022", author:"Trivia Bot", subject:"Food & Drink", question:"What French pastry is filled with cream and topped with chocolate icing?", answer:"eclair", ts: Date.now()-DAY*610 },
   { id:"b3fod023", author:"Trivia Bot", subject:"Food & Drink", question:"What is the name of the thin French pancake?", answer:"crepe", ts: Date.now()-DAY*609 },
   { id:"b3fod024", author:"Trivia Bot", subject:"Food & Drink", question:"What type of plant do vanilla beans come from?", answer:"orchid", ts: Date.now()-DAY*608 },
   { id:"b3fod025", author:"Trivia Bot", subject:"Food & Drink", question:"Which fruit is called the king of fruits in Southeast Asia?", answer:"durian", ts: Date.now()-DAY*607 },
   { id:"b3fod026", author:"Trivia Bot", subject:"Food & Drink", question:"What Italian coffee drink's name means marked or stained?", answer:"macchiato", ts: Date.now()-DAY*606 },
-  { id:"b3fod027", author:"Trivia Bot", subject:"Food & Drink", question:"What alcoholic drink is made by fermenting honey?", answer:"mead", ts: Date.now()-DAY*605 },
-  { id:"b3fod028", author:"Trivia Bot", subject:"Food & Drink", question:"What grain is the main ingredient in Scotch whisky?", answer:"barley", ts: Date.now()-DAY*604 },
+  { id:"b3fod027", author:"Trivia Bot", subject:"Food & Drink", question:"What alcoholic drink is made by fermenting honey?", answer:"mead", alts:["honey wine"], ts: Date.now()-DAY*605 },
+  { id:"b3fod028", author:"Trivia Bot", subject:"Food & Drink", question:"What grain is the main ingredient in Scotch whisky?", answer:"barley", alts:["malted barley", "malt"], ts: Date.now()-DAY*604 },
   { id:"b3fod029", author:"Trivia Bot", subject:"Food & Drink", question:"What pasta's name means little worms?", answer:"vermicelli", ts: Date.now()-DAY*603 },
   { id:"b3fod030", author:"Trivia Bot", subject:"Food & Drink", question:"What pasta's name means little tongues?", answer:"linguine", ts: Date.now()-DAY*602 },
   { id:"b3fod031", author:"Trivia Bot", subject:"Food & Drink", question:"What Hawaiian dish consists of cubed raw fish?", answer:"poke", ts: Date.now()-DAY*601 },
@@ -1120,9 +1389,9 @@ const SEED = [
   { id:"b3art011", author:"Trivia Bot", subject:"Art", question:"Which anonymous street artist created Girl with Balloon?", answer:"banksy", ts: Date.now()-DAY*589 },
   { id:"b3art012", author:"Trivia Bot", subject:"Art", question:"Who sculpted The Thinker?", answer:"auguste rodin", crewNote:"Full name required, matey!", ts: Date.now()-DAY*588 },
   { id:"b3art013", author:"Trivia Bot", subject:"Art", question:"In which city is the Prado Museum?", answer:"madrid", ts: Date.now()-DAY*587 },
-  { id:"b3art014", author:"Trivia Bot", subject:"Art", question:"In which city is the Uffizi Gallery?", answer:"florence", ts: Date.now()-DAY*586 },
+  { id:"b3art014", author:"Trivia Bot", subject:"Art", question:"In which city is the Uffizi Gallery?", answer:"florence", alts:["firenze"], ts: Date.now()-DAY*586 },
   { id:"b3art015", author:"Trivia Bot", subject:"Art", question:"In which city is the Rijksmuseum?", answer:"amsterdam", ts: Date.now()-DAY*585 },
-  { id:"b3art016", author:"Trivia Bot", subject:"Art", question:"In which Russian city is the Hermitage Museum?", answer:"saint petersburg", ts: Date.now()-DAY*584 },
+  { id:"b3art016", author:"Trivia Bot", subject:"Art", question:"In which Russian city is the Hermitage Museum?", answer:"saint petersburg", alts:["petersburg"], ts: Date.now()-DAY*584 },
   { id:"b3art017", author:"Trivia Bot", subject:"Art", question:"What color is made by mixing blue and yellow paint?", answer:"green", ts: Date.now()-DAY*583 },
   { id:"b3art018", author:"Trivia Bot", subject:"Art", question:"Which art movement is Claude Monet associated with?", answer:"impressionism", ts: Date.now()-DAY*582 },
   { id:"b3art019", author:"Trivia Bot", subject:"Art", question:"Which art movement is Andy Warhol associated with?", answer:"pop art", ts: Date.now()-DAY*581 },
@@ -1136,7 +1405,7 @@ const SEED = [
   { id:"b3art027", author:"Trivia Bot", subject:"Art", question:"What is the Japanese art of flower arranging called?", answer:"ikebana", ts: Date.now()-DAY*573 },
   { id:"b3art028", author:"Trivia Bot", subject:"Art", question:"What is a painting of inanimate objects such as fruit and flowers called?", answer:"still life", ts: Date.now()-DAY*572 },
   { id:"b3art029", author:"Trivia Bot", subject:"Art", question:"What type of paint uses egg yolk as a binder?", answer:"tempera", ts: Date.now()-DAY*571 },
-  { id:"b3art030", author:"Trivia Bot", subject:"Art", question:"What type of painting uses transparent water-based pigments on paper?", answer:"watercolor", ts: Date.now()-DAY*570 },
+  { id:"b3art030", author:"Trivia Bot", subject:"Art", question:"What type of painting uses transparent water-based pigments on paper?", answer:"watercolor", alts:["water colour", "watercolour"], ts: Date.now()-DAY*570 },
   { id:"b3mat001", author:"Trivia Bot", subject:"Math", question:"What is the Roman numeral for 100?", answer:"c", ts: Date.now()-DAY*569 },
   { id:"b3mat002", author:"Trivia Bot", subject:"Math", question:"What is the Roman numeral for 500?", answer:"d", ts: Date.now()-DAY*568 },
   { id:"b3mat003", author:"Trivia Bot", subject:"Math", question:"What is the Roman numeral for 1000?", answer:"m", ts: Date.now()-DAY*567 },
@@ -1194,7 +1463,7 @@ const SEED = [
   { id:"b3ani019", author:"Trivia Bot", subject:"Animals", question:"What is the largest rodent in the world?", answer:"capybara", ts: Date.now()-DAY*515 },
   { id:"b3ani020", author:"Trivia Bot", subject:"Animals", question:"Which egg-laying Australian mammal has a duck-like bill?", answer:"platypus", ts: Date.now()-DAY*514 },
   { id:"b3ani021", author:"Trivia Bot", subject:"Animals", question:"What do giant pandas mainly eat?", answer:"bamboo", ts: Date.now()-DAY*513 },
-  { id:"b3ani022", author:"Trivia Bot", subject:"Animals", question:"What do koalas mainly eat?", answer:"eucalyptus", ts: Date.now()-DAY*512 },
+  { id:"b3ani022", author:"Trivia Bot", subject:"Animals", question:"What do koalas mainly eat?", answer:"eucalyptus", alts:["eucalyptus leaves", "gum leaves"], ts: Date.now()-DAY*512 },
   { id:"b3ani023", author:"Trivia Bot", subject:"Animals", question:"What is the largest species of penguin?", answer:"emperor", ts: Date.now()-DAY*511 },
   { id:"b3ani024", author:"Trivia Bot", subject:"Animals", question:"What is a female fox called?", answer:"vixen", ts: Date.now()-DAY*510 },
   { id:"b3ani025", author:"Trivia Bot", subject:"Animals", question:"What is a male swan called?", answer:"cob", ts: Date.now()-DAY*509 },
@@ -1419,6 +1688,12 @@ function checkAnswer(userAnswer, correctAnswer) {
 
   return false;
 }
+// A question is answered correctly if the response matches its main answer OR any accepted alternate
+function checkAnswerFor(userAnswer, q) {
+  if (checkAnswer(userAnswer, q.answer)) return true;
+  return toArr(q.alts).some(a => checkAnswer(userAnswer, a));
+}
+
 // Returns the start timestamp for each leaderboard period
 function getPeriodCutoff(period) {
   const now = new Date();
@@ -1494,6 +1769,16 @@ function buildDailyQueue(questions, dateStr, usedIds=[]) {
   const shuffled = seededShuffle(pool, seed);
   return shuffled.slice(0, Math.min(DAILY_LIMIT, shuffled.length)).map(q => q.id);
 }
+// Swap specific questions out of today's queue WITHOUT reshuffling the rest, so nobody is
+// ever re-served a question they already answered today.
+function replaceInQueue(dq, removedIds, pool, usedIds = []) {
+  const gone = new Set(removedIds);
+  const keep = new Set(dq.qids.filter(id => !gone.has(id)));
+  const repl = buildDailyQueue(pool.filter(x => !keep.has(x.id) && !gone.has(x.id)), dq.date, usedIds);
+  let i = 0;
+  return { ...dq, qids: dq.qids.map(id => gone.has(id) ? (repl[i++] || id) : id) };
+}
+
 function calcPlankVictim(attempts){
   const prev=prevWeekStr();
   const wa={};
@@ -1862,6 +2147,12 @@ function App(){
   const [plank,    setPlank]    = useState(null);
   const [plankHistory,setPlankHistory]=useState([]);
   const [usedQ,setUsedQ]=useState([]);
+  const [appeals,setAppeals]=useState({});
+  const [captains,setCaptains]=useState([]);
+  const [pending,setPending]=useState(outboxLoad().length);
+  const [renameOpen,setRenameOpen]=useState(false);
+  const [renameBusy,setRenameBusy]=useState(null);
+  useEffect(()=>onSyncChange(setPending),[]);
   const [showPlank,setShowPlank]=useState(false);
   const [notificationsEnabled,setNotificationsEnabled]=useState(pget("notifications_enabled")||false);
   const [plankIsVictim,setPlankIsVictim]=useState(false);
@@ -1872,26 +2163,29 @@ function App(){
     // Safety net — if loading takes more than 8 seconds, show app anyway
     const safetyTimer = setTimeout(() => setLoading(false), 8000);
     (async()=>{
-      const [q,s,a,at,dl,fl,pu,bo,no,pl,ph,dqRaw,uq] = await Promise.all([
+      const [q,s,a,at,dl,fl,pu,bo,no,pl,ph,dqRaw,uq,ap,cp] = await Promise.all([
         sget(KEYS.questions), sget(KEYS.scores),   sget(KEYS.answered),
         sget(KEYS.attempts),  sget(KEYS.dailyLog),  sget(KEYS.flags),
         sget(KEYS.pulled),    sget(KEYS.bonuses),   sget(KEYS.notices),
         sget(KEYS.plank),     sget(KEYS.plankHistory), sget(KEYS.dailyQ),
-        sget(KEYS.usedQ),
+        sget(KEYS.usedQ), sget(KEYS.appeals), sget(KEYS.captains),
       ]);
 
       let questions = q  || SEED;
-      const scores    = s  || {};
-      const answered  = a  || {};
-      const attempts  = at || {};
-      const dailyLog  = dl || {};
+      // Pending (not-yet-sent) writes are layered back on top of what Firebase returned
+      const scores    = overlay(KEYS.scores,   s  || {});
+      const answered  = overlay(KEYS.answered, a  || {});
+      const attempts  = overlay(KEYS.attempts, at || {});
+      const dailyLog  = overlay(KEYS.dailyLog, dl || {});
       const flags     = fl || {};
       const pulled    = pu || [];
-      const bonuses   = bo || {};
-      const notices   = no || {};
+      const bonuses   = overlay(KEYS.bonuses, bo || {});
+      const notices   = overlay(KEYS.notices, no || {});
       const plankData = pl || null;
       const plankHist = ph || [];
-      const saved     = pget(KEYS.username);
+      const savedRaw  = pget(KEYS.username);
+      const saved     = savedRaw ? cleanName(savedRaw) : savedRaw;
+      if (saved && saved !== savedRaw) pset(KEYS.username, saved);
       const today     = todayStr();
 
       // Sync seed questions with Firebase:
@@ -1907,10 +2201,17 @@ function App(){
         if (item.author === "Trivia Bot") {
           if (retired.has(item.id)) { seedChanged = true; return; }
           const sd = seedById.get(item.id);
-          if (sd && (item.question !== sd.question || item.answer !== sd.answer || (item.crewNote || "") !== (sd.crewNote || ""))) {
-            seedChanged = true;
-            synced.push({ ...item, question: sd.question, answer: sd.answer, crewNote: sd.crewNote || "" });
-            return;
+          if (sd) {
+            // Alternates = the seed's list PLUS any the crew accepted later (never lose those)
+            const altUnion = [...new Set([...toArr(sd.alts), ...toArr(item.alts)])];
+            const altChanged = altUnion.length !== toArr(item.alts).length;
+            if (item.question !== sd.question || item.answer !== sd.answer || (item.crewNote || "") !== (sd.crewNote || "") || altChanged) {
+              seedChanged = true;
+              const fixed = { ...item, question: sd.question, answer: sd.answer, crewNote: sd.crewNote || "" };
+              if (altUnion.length) fixed.alts = altUnion;
+              synced.push(fixed);
+              return;
+            }
           }
         }
         synced.push(item);
@@ -1919,11 +2220,12 @@ function App(){
       const missingSeed = SEED.filter(x => !haveIds.has(x.id) && !retired.has(x.id));
       if (seedChanged || missingSeed.length > 0 || !q) {
         questions = [...synced, ...missingSeed];
-        await sset(KEYS.questions, questions);
+        sset(KEYS.questions, questions);
         console.log(`Question sync: +${missingSeed.length} added`);
       } else {
         questions = synced;
       }
+      questions = overlay(KEYS.questions, questions);
 
       const pulledIds = new Set(pulled.map(p=>p.qid));
       const activeQ   = questions.filter(q=>!pulledIds.has(q.id));
@@ -1943,19 +2245,19 @@ function App(){
         const repl = buildDailyQueue(activeQ.filter(x => !dq.qids.includes(x.id)), today, usedQList);
         let ri = 0;
         dq = { date: today, qids: dq.qids.map(id => activeIds.has(id) ? id : (repl[ri++] || id)) };
-        await sset(KEYS.dailyQ, dq);
-        await sset(KEYS.usedQ, [...new Set([...usedQList, ...dq.qids])]);
+        sset(KEYS.dailyQ, dq);
+        sset(KEYS.usedQ, [...new Set([...usedQList, ...dq.qids])]);
       }
       if (!dq || dq.date !== today) {
         dq = { date:today, qids: buildDailyQueue(activeQ, today, usedQList) };
         const newUsedQ = [...new Set([...usedQList, ...dq.qids])];
-        await Promise.all([sset(KEYS.dailyQ, dq), sset(KEYS.usedQ, newUsedQ)]);
+        sset(KEYS.dailyQ, dq); sset(KEYS.usedQ, newUsedQ);
         setUsedQ(newUsedQ);
       } else {
         setUsedQ(usedQList);
         // If usedQ was cleaned up, save the cleaned version
         if (cleanUsedQ.length !== rawUsedQ.length || usedQList.length !== cleanUsedQ.length) {
-          await sset(KEYS.usedQ, usedQList);
+          sset(KEYS.usedQ, usedQList);
         }
       }
 
@@ -1966,17 +2268,18 @@ function App(){
         if(result){
           const wiped={...scores};
           if(wiped[result.victim]) wiped[result.victim]=wiped[result.victim].filter(e=>weekStr(e.ts)!==prevWeek);
-          await sset(KEYS.scores,wiped); nextScores=wiped;
+          enqueueOp({type:"weekWipe",user:result.victim,week:prevWeek}); nextScores=wiped;
           nextPlank={weekStr:prevWeek,victim:result.victim,pct:result.pct,correct:result.correct,total:result.total,processedAt:Date.now()};
-          await sset(KEYS.plank,nextPlank);
+          sset(KEYS.plank,nextPlank);
           nextHistory=[...plankHist.filter(h=>h.weekStr!==prevWeek),nextPlank];
-          await sset(KEYS.plankHistory,nextHistory);
+          sset(KEYS.plankHistory,nextHistory);
         }
       }
 
       setQuestions(questions); setScores(nextScores); setAnswered(answered);
       setAttempts(attempts); setDailyLog(dailyLog); setFlags(flags);
       setPulled(pulled); setBonuses(bonuses); setNotices(notices);
+      setAppeals(overlay(KEYS.appeals, ap || {})); setCaptains(toArr(cp));
       setDailyQ(dq); setPlank(nextPlank); setPlankHistory(nextHistory);
       if(saved) setUsername(saved);
       if(nextPlank&&nextPlank.weekStr===prevWeekStr()){
@@ -1985,35 +2288,90 @@ function App(){
       }
       clearTimeout(safetyTimer);
       setLoading(false);
+      const renamedTo=pget("renamed_notice");
+      if(renamedTo){ pset("renamed_notice",null); setTimeout(()=>showToast(`Welcome aboard, ${renamedTo}! Yer gold and history came along ⚓`),600); }
 
       // ── Real-time listeners — update UI when other players make changes ──
       const db = getDB();
       if (db) {
-        db.ref("scallywag/" + KEYS.scores).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.scores); setScores(val); }
+        const listen = (key, apply) => db.ref("scallywag/" + key).on("value", snap => {
+          const val = snap.val(); if (val) { invalidate(key); apply(overlay(key, val)); }
         });
-        db.ref("scallywag/" + KEYS.questions).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.questions); setQuestions(val); }
-        });
-        db.ref("scallywag/" + KEYS.flags).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.flags); setFlags(val); }
-        });
-        db.ref("scallywag/" + KEYS.notices).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.notices); setNotices(val); }
-        });
-        // Keep daily log in sync so answered questions persist across browser sessions
-        db.ref("scallywag/" + KEYS.dailyLog).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.dailyLog); setDailyLog(val); }
-        });
-        // Keep bonuses in sync
-        db.ref("scallywag/" + KEYS.bonuses).on("value", snap => {
-          const val = snap.val(); if(val){ invalidate(KEYS.bonuses); setBonuses(val); }
-        });
+        listen(KEYS.scores,    setScores);
+        listen(KEYS.questions, v => setQuestions(toArr(v)));
+        listen(KEYS.flags,     setFlags);
+        listen(KEYS.notices,   setNotices);
+        listen(KEYS.dailyLog,  setDailyLog);
+        listen(KEYS.bonuses,   setBonuses);
+        listen(KEYS.attempts,  setAttempts);
+        listen(KEYS.appeals,   setAppeals);
+        listen(KEYS.captains,  v => setCaptains(toArr(v)));
       }
     })();
   },[]);
 
   const showToast=msg=>{setToast(msg);setTimeout(()=>setToast(""),2800);};
+
+  // Sign out: everything stays safe in the cloud; sign back in any time, on any device
+  const signOut=async()=>{
+    try{ if(notificationsEnabled) await disableNotifications(username); }catch{}
+    pset(KEYS.username,null); pset("notifications_enabled",false);
+    setNotificationsEnabled(false); setShowPlank(false); setRenameOpen(false);
+    setScreen("home"); setUsername("");
+  };
+
+  // ── Change name: moves ALL of this player's data to the new name (see migrateName) ──
+  const finishRename=to=>{
+    pset(KEYS.username,to); pset("renamed_notice",to);
+    try{localStorage.removeItem(RENAME_KEY);}catch{}
+    setRenameBusy("Done! Hoisting yer new colours…");
+    setTimeout(()=>{try{window.location.reload();}catch{}},700);
+  };
+  const startRename=async rawNew=>{
+    const to=cleanName(rawNew), from=username;
+    if(!to) return "Pick a name first, matey.";
+    if(to.length>24) return "Keep it to 24 characters or fewer, matey.";
+    if(to===from) return "That's already yer name!";
+    const db=getDB();
+    if(!db||!_connected||(typeof navigator!=="undefined"&&navigator.onLine===false)) return "Ye need a signal to change names, so yer whole history can move with ye.";
+    let rec=null; try{rec=JSON.parse(localStorage.getItem(RENAME_KEY)||"null");}catch{}
+    if(rec&&rec.from===from&&rec.to!==to) return `A name change to "${rec.to}" is still finishing. Give it a moment, then try again.`;
+    const resuming=!!(rec&&rec.from===from&&rec.to===to);
+    setRenameBusy("Checking the crew roster…");
+    try{
+      await flushOutbox();                       // anything still waiting must land under the OLD name first
+      if(outboxLoad().length){ setRenameBusy(null); return "Some answers are still syncing. Try again in a moment."; }
+      if(!resuming){
+        const taken=await nameIsTaken(db,from,to);
+        if(taken){ setRenameBusy(null); return taken; }
+      }
+      try{localStorage.setItem(RENAME_KEY,JSON.stringify({from,to,ts:Date.now()}));}catch{}
+      await migrateName(db,from,to,setRenameBusy);
+      setRenameOpen(false);
+      finishRename(to);
+      return null;
+    }catch(err){
+      setRenameBusy(null);
+      return "The seas got rough ("+((err&&err.message)||"error")+"). Nothing was lost. Try again and it picks up where it left off.";
+    }
+  };
+  // A rename that was interrupted (signal lost, app closed) finishes by itself next time there's a signal
+  useEffect(()=>{
+    if(!username||loading) return;
+    let rec=null; try{rec=JSON.parse(localStorage.getItem(RENAME_KEY)||"null");}catch{}
+    if(!rec||rec.from!==username) return;
+    let stopped=false, running=false;
+    const attempt=async()=>{
+      if(stopped||running) return;
+      const db=getDB(); if(!db||!_connected) return;
+      running=true;
+      try{ await flushOutbox(); await migrateName(db,rec.from,rec.to,setRenameBusy); stopped=true; finishRename(rec.to); }
+      catch(err){ setRenameBusy(null); }
+      running=false;
+    };
+    attempt(); const t=setInterval(attempt,15000);
+    return()=>{stopped=true;clearInterval(t);};
+  },[username,loading]);
 
   const sv=q=>{setQuestions(q);sset(KEYS.questions,q);};
   const ss=s=>{setScores(s);sset(KEYS.scores,s);};
@@ -2026,10 +2384,12 @@ function App(){
   const sno=no=>{setNotices(no);sset(KEYS.notices,no);};
 
   const handleLogin=async name=>{
-    if(!name.trim()) return;
-    const trimmed = name.trim();
+    const trimmed = cleanName(name);
+    if(!trimmed) return;
     setUsername(trimmed);
     pset(KEYS.username, trimmed);
+    setNotificationsEnabled(!!pget("notifications_enabled"));
+    setScreen("home");
 
     // Re-sync daily log and bonuses from Firebase for this user
     // so answers made on other devices/browsers are recognized
@@ -2049,104 +2409,147 @@ function App(){
       console.warn("Re-sync after login failed:", e.message);
     }
   };
-  const addScore=async(user,pts)=>{
-    const n={...scores};
-    if(!n[user])n[user]=[];
-    n[user]=[...n[user],{ts:now(),pts}];
-    setScores(n);
-    // Write directly to Firebase with retry
-    const db=getDB();
-    if(db){
-      let retries=3;
-      while(retries>0){
-        try{
-          await db.ref("scallywag/"+KEYS.scores).set(n);
-          try{localStorage.setItem("sg_shared_"+KEYS.scores,JSON.stringify(n));}catch{}
-          _cache[KEYS.scores]=n;
-          break;
-        }catch(e){
-          retries--;
-          console.warn("addScore write failed, retrying:",e.message);
-          if(retries>0) await new Promise(r=>setTimeout(r,1000));
-        }
-      }
-    } else {
-      try{localStorage.setItem("sg_shared_"+KEYS.scores,JSON.stringify(n));}catch{}
+  // ── Reliable, atomic writes (see the outbox near the top of this file) ──
+  const addScore=(user,pts,when,id)=>{
+    const entry={id:id||newId(),ts:when||now(),pts};
+    setScores(prev=>{const n={...prev};const a=toArr(n[user]);if(!a.some(x=>x.id===entry.id))n[user]=[...a,entry];mirror(KEYS.scores,n);return n;});
+    enqueueOp({type:"score",user,entry});
+  };
+  const markAnswered=(qid,user)=>{
+    setAnswered(prev=>{const n={...prev};const a=toArr(n[qid]);if(!a.includes(user))n[qid]=[...a,user];mirror(KEYS.answered,n);return n;});
+    enqueueOp({type:"answered",qid,user});
+  };
+  const recordAttempt=(qid,user,answer,correct)=>{
+    const entry={id:newId(),user,answer,correct,ts:now()};
+    setAttempts(prev=>{const n={...prev};n[qid]=[...toArr(n[qid]),entry];mirror(KEYS.attempts,n);return n;});
+    enqueueOp({type:"attempt",qid,entry});
+  };
+  const markDailyAnswer=(user,qid)=>{
+    const key=`${user}|${todayStr()}`;
+    const n={...dailyLog};
+    const a=toArr(n[key]);
+    if(!a.includes(qid))n[key]=[...a,qid];
+    setDailyLog(n);mirror(KEYS.dailyLog,n);
+    enqueueOp({type:"daily",key,qid});
+    return n;
+  };
+  const spendBonus=()=>{
+    setBonuses(prev=>{const n={...prev};const v=(n[username]||0)-1;if(v>0)n[username]=v;else delete n[username];mirror(KEYS.bonuses,n);return n;});
+    enqueueOp({type:"bonusUse",user:username});
+  };
+  const recordResult=(qid,ans,correct)=>{
+    if(correct) addScore(username,10);
+    markAnswered(qid,username);
+    recordAttempt(qid,username,ans,correct);
+    const dl=markDailyAnswer(username,qid);
+    if(bonusCount>0) spendBonus();
+    return dl;
+  };
+  const pushNoticeTo=(user,notice)=>{
+    const nt={...notice,id:notice.id||newId(),ts:notice.ts||now()};
+    if(user===username) setNotices(prev=>{const n={...prev};const a=toArr(n[user]);if(!a.some(x=>(x.id||x.qid)===nt.id))n[user]=[...a,nt];mirror(KEYS.notices,n);return n;});
+    enqueueOp({type:"notice",user,notice:nt});
+  };
+
+  // ── Appeals & accepted alternate answers ──
+  const appealList=Object.values(appeals||{}).filter(Boolean);
+  const openAppeals=appealList.filter(a=>a.status==="open");
+  const myOpenAppeals=openAppeals.filter(a=>{const qq=questions.find(x=>x.id===a.qid);return qq&&qq.author===username;}).length;
+  const isCaptain=!!username&&[...DEFAULT_CAPTAINS,...toArr(captains)].some(x=>String(x).toLowerCase()===username.toLowerCase());
+  const setAppealStatus=(id,status)=>{
+    setAppeals(prev=>prev[id]?{...prev,[id]:{...prev[id],status}}:prev);
+    enqueueOp({type:"appealStatus",id,status});
+  };
+  const acceptAnswer=(qid,rawAnswer,justCreated=[])=>{
+    const q=questions.find(x=>x.id===qid);
+    const alt=String(rawAnswer||"").trim().toLowerCase();
+    if(!q||!alt) return;
+    const updated={...q,alts:[...new Set([...toArr(q.alts),alt])]};
+    setQuestions(prev=>{const n=prev.map(x=>x.id===qid?updated:x);mirror(KEYS.questions,n);return n;});
+    enqueueOp({type:"alt",qid,alt});
+    // Everyone whose wrong answer now counts gets their points (dated when they answered)
+    const credited=[];
+    toArr(attempts[qid]).filter(a=>!a.correct&&checkAnswerFor(a.answer,updated)).forEach(a=>{
+      credited.push(a.user);
+      addScore(a.user,10,a.ts,`credit-${qid}-${a.user}`);
+      setAttempts(prev=>({...prev,[qid]:toArr(prev[qid]).map(x=>x.user===a.user&&x.ts===a.ts&&!x.correct?{...x,correct:true,accepted:true}:x)}));
+      enqueueOp({type:"attemptFix",qid,user:a.user,ts:a.ts});
+      pushNoticeTo(a.user,{id:`credit-${qid}`,qid,kind:"credit",text:`Good news! Yer answer "${a.answer}" was accepted as correct on a ${q.subject} question. +10 gold added to yer chest! 🪙`});
+    });
+    // (justCreated covers an appeal made a moment ago that React has not put into appealList yet)
+    [...appealList,...justCreated.filter(j=>!appealList.some(x=>x.id===j.id))].filter(ap=>ap.qid===qid&&ap.status==="open"&&checkAnswerFor(ap.answer,updated)).forEach(ap=>setAppealStatus(ap.id,"accepted"));
+    showToast(credited.length?`Accepted! ${credited.length} crew member${credited.length!==1?"s":""} credited ⚓`:"Accepted! Answers like that will count from now on ⚓");
+  };
+  const declineAppeal=(id)=>{
+    const ap=appeals[id]; if(!ap) return;
+    setAppealStatus(id,"declined");
+    const q=questions.find(x=>x.id===ap.qid);
+    pushNoticeTo(ap.user,{id:`decl-${id}`,qid:ap.qid,kind:"appeal",text:`Yer appeal for "${ap.answer}" on a ${q?q.subject:"trivia"} question was reviewed and not accepted this time, matey.`});
+  };
+  const createAppeal=(qid,answer)=>{
+    const q=questions.find(x=>x.id===qid); if(!q) return;
+    const norm=normalize(answer);
+    if(!norm) return;
+    if(appealList.some(a=>a.qid===qid&&a.user===username&&a.norm===norm&&a.status!=="declined")){showToast("Ye already appealed that one, matey.");return;}
+    const appeal={id:newId(),qid,user:username,answer:answer.trim(),norm,ts:now(),status:"open"};
+    setAppeals(prev=>({...prev,[appeal.id]:appeal}));
+    enqueueOp({type:"appeal",appeal});
+    showToast("Appeal sent! ⚖️");
+    if(q.author&&q.author!=="Trivia Bot"&&q.author!==username){
+      pushNoticeTo(q.author,{id:`appeal-${appeal.id}`,qid,kind:"appeal",text:`${username} appealed the answer "${appeal.answer}" on yer question "${q.question.length>60?q.question.slice(0,57)+"…":q.question}". Open Submit → Yer Questions to review it.`});
+    }
+    if(q.author==="Trivia Bot"){
+      // No author to judge a Trivia Bot question: it's accepted once enough different players agree
+      const same=[...appealList,appeal].filter(a=>a.qid===qid&&a.norm===norm&&a.status==="open");
+      if(new Set(same.map(a=>a.user)).size>=APPEAL_AUTO_ACCEPT) acceptAnswer(qid,appeal.answer,[appeal]);
     }
   };
-  const markAnswered=async(qid,user)=>{
-    const a={...answered};
-    if(!a[qid])a[qid]=[];
-    if(!a[qid].includes(user))a[qid]=[...a[qid],user];
-    setAnswered(a);
-    const db=getDB();
-    if(db){
-      let retries=3;
-      while(retries>0){
-        try{
-          await db.ref("scallywag/"+KEYS.answered).set(a);
-          try{localStorage.setItem("sg_shared_"+KEYS.answered,JSON.stringify(a));}catch{}
-          _cache[KEYS.answered]=a;
-          break;
-        }catch(e){
-          retries--;
-          if(retries>0) await new Promise(r=>setTimeout(r,1000));
-        }
-      }
-    }
-  };
-  const recordAttempt=(qid,user,answer,correct)=>{const at={...attempts};if(!at[qid])at[qid]=[];at[qid]=[...at[qid],{user,answer,correct,ts:now()}];sat(at);};
-  const markDailyAnswer=(user,qid)=>{const key=`${user}|${todayStr()}`;const n={...dailyLog};if(!n[key])n[key]=[];if(!n[key].includes(qid))n[key]=[...n[key],qid];sdl(n);return n;};
+
   const dismissPlank=()=>{setShowPlank(false);pset("plank_dismissed",plank?.weekStr);};
 
-  // Force sync all local data to Firebase — used when sync gets out of step
+  // "Sync Now": re-send anything this player earned that only exists on this device,
+  // push everything waiting in the outbox, then pull a fresh copy of the shared data.
   const forceSyncToFirebase=async()=>{
     const db=getDB();
-    if(!db) return false;
+    if(!db||!_connected) return false;
     try{
-      // Pull fresh from Firebase first
-      invalidate(KEYS.scores); invalidate(KEYS.answered); invalidate(KEYS.dailyLog);
-      const [freshScores,freshAnswered,freshDailyLog]=await Promise.all([
-        sget(KEYS.scores), sget(KEYS.answered), sget(KEYS.dailyLog)
-      ]);
-
-      // Merge local scores with Firebase scores (keep highest/most entries)
+      invalidate(KEYS.scores); invalidate(KEYS.dailyLog);
+      const [srvScores,srvDaily]=(await Promise.all([sget(KEYS.scores),sget(KEYS.dailyLog)])).map(x=>x||{});
       const localScores=JSON.parse(localStorage.getItem("sg_shared_"+KEYS.scores)||"{}");
-      const mergedScores={...(freshScores||{})};
-      Object.entries(localScores).forEach(([user,entries])=>{
-        if(!mergedScores[user]) mergedScores[user]=[];
-        // Add any local entries not in Firebase (by timestamp)
-        const fbTs=new Set((mergedScores[user]||[]).map(e=>e.ts));
-        entries.forEach(e=>{ if(!fbTs.has(e.ts)) mergedScores[user].push(e); });
-        mergedScores[user].sort((a,b)=>a.ts-b.ts);
+      const pendingIds=new Set(outboxLoad().filter(o=>o.type==="score").map(o=>o.entry.id));
+      const srv=toArr(srvScores[username]);
+      toArr(localScores[username]).forEach(e=>{
+        if(e.id&&pendingIds.has(e.id)) return;
+        if(!srv.some(x=>x.ts===e.ts&&x.pts===e.pts)) enqueueOp({type:"score",user:username,entry:{id:e.id||`legacy-${e.ts}-${e.pts}`,ts:e.ts,pts:e.pts}});
       });
-
-      // Merge local dailyLog
-      const localDL=JSON.parse(localStorage.getItem("sg_shared_"+KEYS.dailyLog)||"{}");
-      const mergedDL={...(freshDailyLog||{})};
-      Object.entries(localDL).forEach(([key,qids])=>{
-        if(!mergedDL[key]) mergedDL[key]=[];
-        const existing=new Set(mergedDL[key]);
-        qids.forEach(q=>{ if(!existing.has(q)) mergedDL[key].push(q); });
+      const localDaily=JSON.parse(localStorage.getItem("sg_shared_"+KEYS.dailyLog)||"{}");
+      Object.entries(localDaily).forEach(([k,qids])=>{
+        if(!k.startsWith(username+"|")) return;
+        const have=toArr(srvDaily[k]);
+        toArr(qids).forEach(qq=>{ if(!have.includes(qq)) enqueueOp({type:"daily",key:k,qid:qq}); });
       });
-
-      // Write merged data back to Firebase
-      await Promise.all([
-        db.ref("scallywag/"+KEYS.scores).set(mergedScores),
-        db.ref("scallywag/"+KEYS.dailyLog).set(mergedDL),
-      ]);
-
-      setScores(mergedScores);
-      setDailyLog(mergedDL);
-      _cache[KEYS.scores]=mergedScores;
-      _cache[KEYS.dailyLog]=mergedDL;
-      return true;
+      _retryDelay=2000;
+      await flushOutbox();
+      [KEYS.scores,KEYS.dailyLog,KEYS.answered,KEYS.attempts,KEYS.bonuses,KEYS.notices,KEYS.questions].forEach(invalidate);
+      const [s2,dl2,an2,at2,bo2,no2,q2]=await Promise.all([sget(KEYS.scores),sget(KEYS.dailyLog),sget(KEYS.answered),sget(KEYS.attempts),sget(KEYS.bonuses),sget(KEYS.notices),sget(KEYS.questions)]);
+      if(s2) setScores(overlay(KEYS.scores,s2));
+      if(dl2) setDailyLog(overlay(KEYS.dailyLog,dl2));
+      if(an2) setAnswered(overlay(KEYS.answered,an2));
+      if(at2) setAttempts(overlay(KEYS.attempts,at2));
+      if(bo2) setBonuses(overlay(KEYS.bonuses,bo2));
+      if(no2) setNotices(overlay(KEYS.notices,no2));
+      if(q2) setQuestions(toArr(overlay(KEYS.questions,q2)));
+      return outboxLoad().length===0;
     }catch(e){
       console.warn("Force sync failed:",e.message);
       return false;
     }
   };
-  const dismissNotice=(user,qid)=>{const n={...notices};if(n[user])n[user]=n[user].filter(x=>x.qid!==qid);sno(n);};
+
+  const dismissNotice=(user,nid)=>{
+    setNotices(prev=>{const n={...prev};n[user]=toArr(n[user]).filter(x=>(x.id||x.qid)!==nid);mirror(KEYS.notices,n);return n;});
+    enqueueOp({type:"noticeDismiss",user,nid});
+  };
 
 
 
@@ -2160,14 +2563,16 @@ function App(){
       const np=[...pulled,{qid,subject:q.subject,question:q.question,pulledAt:now(),affectedUsers:affected}];
       spu(np);
       if(affected.length>0){
-        const nb={...bonuses},nn={...notices};
-        affected.forEach(user=>{nb[user]=(nb[user]||0)+1;if(!nn[user])nn[user]=[];nn[user]=[...nn[user],{qid,subject:q.subject,question:q.question,ts:now()}];});
-        sbo(nb); sno(nn);
+        const nb={...bonuses};
+        affected.forEach(user=>{nb[user]=(nb[user]||0)+1;pushNoticeTo(user,{id:`flag-${qid}`,qid,subject:q.subject,question:q.question});});
+        sbo(nb);
       }
       const pids=new Set(np.map(p=>p.qid));
       const aq=questions.filter(q=>!pids.has(q.id));
-      const newDq={date:todayStr(),qids:buildDailyQueue(aq,todayStr())};
-      setDailyQ(newDq); sset(KEYS.dailyQ,newDq);
+      if(dailyQ&&dailyQ.date===todayStr()){
+        const newDq=replaceInQueue(dailyQ,[qid],aq,usedQ);
+        setDailyQ(newDq); sset(KEYS.dailyQ,newDq);
+      }
       showToast("Question pulled by the crew! 🏴‍☠️");
     } else {
       const rem=FLAG_THRESHOLD-fc;
@@ -2178,35 +2583,42 @@ function App(){
   const dailyAnsweredCount=username?(dailyLog[`${username}|${todayStr()}`]||[]).length:0;
   const bonusCount=username?(bonuses[username]||0):0;
   const effectiveLimit=DAILY_LIMIT+bonusCount;
-  const userNotices=username?(notices[username]||[]):[];
+  const userNotices=username?toArr(notices[username]):[];
   const pulledIds=new Set(pulled.map(p=>p.qid));
   const activeQuestions=questions.filter(q=>!pulledIds.has(q.id));
 
   const e=React.createElement;
 
-  if(loading) return e("div",{style:{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"#0f0f0f"}},
+  // A phone with no saved name goes straight to the login; it does not need to wait for game data
+  if(loading&&(username||pget(KEYS.username))) return e("div",{style:{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"#0f0f0f"}},
     e("div",{style:{width:36,height:36,border:"3px solid #222",borderTop:"3px solid #d4a017",borderRadius:"50%",animation:"spin .8s linear infinite"}}),
     e("p",{style:{color:"#555",fontFamily:"Lato,sans-serif",marginTop:14,fontSize:13,letterSpacing:2,textTransform:"uppercase"}},"Boarding the ship…")
   );
 
-  if(!username) return e(LoginScreen,{nameInput,setNameInput,onLogin:()=>handleLogin(nameInput)});
+  if(!username) return e(LoginScreen,{onLogin:handleLogin});
 
   return e("div",{style:{minHeight:"100dvh",background:"#0f0f0f",color:"#e8dcc8",fontFamily:"'Lato',sans-serif",display:"flex",flexDirection:"column",paddingBottom:72}},
     showPlank&&plank&&e(TheatricalPlankScene,{victim:plank.victim,pct:plank.pct,correct:plank.correct,total:plank.total,isVictim:plankIsVictim,onDismiss:dismissPlank}),
     e(AppHeader,{username,setScreen,noticeCount:userNotices.length}),
+    pending>0&&e(SyncBanner,{pending,onRetry:()=>{_retryDelay=2000;flushOutbox();}}),
     userNotices.length>0&&screen!=="settings"&&e(NoticeBanner,{notices:userNotices,onDismiss:qid=>dismissNotice(username,qid)}),
     e("main",{style:{flex:1,overflowY:"auto",overflowX:"hidden",width:"100%",WebkitOverflowScrolling:"touch"}},
       screen==="home"&&e(HomeScreen,{username,questions:activeQuestions,scores,dailyAnsweredCount,effectiveLimit,bonusCount,plank,onNavigate:setScreen,onShowPlank:()=>{setPlankIsVictim(plank?.victim===username);setShowPlank(true);}}),
       screen==="play"&&e(PlayScreen,{username,questions:activeQuestions,answered,dailyQ,dailyLog,dailyAnsweredCount,effectiveLimit,flags,pulledIds,
-        onCorrect:(qid,ans)=>{addScore(username,10);markAnswered(qid,username);recordAttempt(qid,username,ans,true);const dl=markDailyAnswer(username,qid);if(bonusCount>0){const nb={...bonuses};nb[username]=nb[username]-1;if(nb[username]<=0)delete nb[username];sbo(nb);}return dl;},
-        onWrong:(qid,ans)=>{markAnswered(qid,username);recordAttempt(qid,username,ans,false);const dl=markDailyAnswer(username,qid);if(bonusCount>0){const nb={...bonuses};nb[username]=nb[username]-1;if(nb[username]<=0)delete nb[username];sbo(nb);}return dl;},
+        onCorrect:(qid,ans)=>recordResult(qid,ans,true),
+        onWrong:(qid,ans)=>recordResult(qid,ans,false),
+        onAppeal:createAppeal,
         onFlag:flagQuestion}),
-      screen==="submit"&&e(SubmitScreen,{username,questions,answered,attempts,onSubmit:q=>{const next=[...questions,{...q,id:uid(),author:username,ts:now()}];sv(next);const pids=new Set(pulled.map(p=>p.qid));const aq=next.filter(q=>!pids.has(q.id));const newDq={date:todayStr(),qids:buildDailyQueue(aq,todayStr())};setDailyQ(newDq);sset(KEYS.dailyQ,newDq);showToast("Question added! 🎉");setScreen("home");}}),
+      screen==="submit"&&e(SubmitScreen,{username,questions,answered,attempts,appeals:openAppeals,onAccept:acceptAnswer,onDecline:declineAppeal,onSubmit:q=>{const next=[...questions,{...q,id:uid(),author:username,ts:now()}];setQuestions(next);mirror(KEYS.questions,next);enqueueOp({type:"addQuestion",q:next[next.length-1]});showToast("Question added! 🎉");setScreen("home");}}),
       screen==="leaderboard"&&e(LeaderboardScreen,{scores,username,plank,plankHistory}),
-      screen==="profile"&&e(ProfileScreen,{username,questions,attempts,scores,dailyLog,plankHistory,onOpenSettings:()=>setScreen("settings")}),
-      screen==="settings"&&e(SettingsScreen,{username,userNotices,onBack:()=>setScreen("profile"),notificationsEnabled,setNotificationsEnabled,forceSyncToFirebase,onSaveName:newName=>{if(!newName.trim())return;setUsername(newName.trim());pset(KEYS.username,newName.trim());showToast("Name updated! ⚓");setScreen("home");},onDismissNotice:qid=>dismissNotice(username,qid)})
+      screen==="profile"&&e(ProfileScreen,{onRename:()=>setRenameOpen(true),username,questions,attempts,scores,dailyLog,plankHistory,isCaptain,openAppeals,onAccept:acceptAnswer,onDecline:declineAppeal,onOpenSettings:()=>setScreen("settings")}),
+      screen==="settings"&&e(SettingsScreen,{username,userNotices,onBack:()=>setScreen("profile"),notificationsEnabled,setNotificationsEnabled,forceSyncToFirebase,onRename:()=>setRenameOpen(true),
+        onSignOut:signOut,
+        onDismissNotice:qid=>dismissNotice(username,qid)})
     ),
-    e(BottomNav,{screen,setScreen,dailyAnsweredCount,effectiveLimit,noticeCount:userNotices.length}),
+    e(BottomNav,{screen,setScreen,dailyAnsweredCount,effectiveLimit,noticeCount:userNotices.length+(isCaptain?openAppeals.length:0),appealBadge:myOpenAppeals}),
+    renameOpen&&e(RenameSheet,{current:username,onSubmit:startRename,onClose:()=>{if(!renameBusy)setRenameOpen(false);}}),
+    renameBusy&&e(RenameBusy,{text:renameBusy}),
     toast&&e("div",{style:{position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",background:"#1a1500",border:"1px solid #d4a017",color:"#d4a017",borderRadius:24,padding:"11px 22px",fontSize:14,zIndex:9999,whiteSpace:"nowrap",animation:"fadeup .3s ease",boxShadow:"0 8px 32px rgba(0,0,0,.5)"}},toast)
   );
 }
@@ -2215,15 +2627,81 @@ function App(){
 // These are identical to the trivia-app.jsx versions but using React.createElement instead of JSX.
 // For brevity they reference the functions defined below.
 
-function LoginScreen({nameInput,setNameInput,onLogin}){
+function LoginScreen({onLogin}){
   const e=React.createElement;
+  const [mode,setMode]=useState("new");          // "new" | "existing"
+  const [name,setName]=useState("");
+  const [roster,setRoster]=useState(null);       // null = checking, false = can't reach it, object = loaded
+  useEffect(()=>{
+    let dead=false;
+    (async()=>{
+      const db=getDB();
+      if(!db){ setRoster(false); return; }
+      try{ const r=await withTimeout(loadRoster(db),8000); if(!dead) setRoster(r); }
+      catch{ if(!dead) setRoster(false); }
+    })();
+    return()=>{dead=true;};
+  },[]);
+  const typed=cleanName(name);
+  const names=roster?Object.keys(roster):[];
+  const exact=(typed&&roster)?names.find(n=>normName(n)===normName(typed)):null;
+  const chips=roster?names.filter(n=>!typed||normName(n).includes(normName(typed))).sort((a,b)=>(roster[b].gold-roster[a].gold)||a.localeCompare(b)).slice(0,40):[];
+  const checking=roster===null, unavailable=roster===false;
+  const tooLong=typed.length>24, reserved=normName(typed)==="trivia bot";
+  const st=exact?roster[exact]:null;
+  const acc=st&&st.answered?Math.round(st.correct/st.answered*100):0;
+  const rankTitle=st?RANKS[RANKS.reduce((r,x,i)=>st.gold>=x.min?i:r,0)].title:"";
+
+  const primary=()=>{
+    if(mode==="existing"){ if(exact) onLogin(exact); else if(unavailable&&typed) onLogin(typed); }
+    else if(typed&&!exact&&!reserved&&!tooLong&&!checking) onLogin(typed);
+  };
+  const seg=(id,label)=>e("button",{onClick:()=>setMode(id),style:{flex:1,background:mode===id?"#1a1400":"none",border:mode===id?"1px solid #3a2a00":"1px solid transparent",borderRadius:9,color:mode===id?"#d4a017":"#555",padding:"10px 6px",fontSize:12,fontWeight:mode===id?700:400,fontFamily:"Lato,sans-serif"}},label);
+  const note=(txt,color)=>e("p",{style:{color:color||"#777",fontSize:12,lineHeight:1.5,marginBottom:12,textAlign:"left"}},txt);
+  const linkBtn=(txt,fn)=>e("button",{onClick:fn,style:{background:"none",border:"none",color:"#d4a017",fontSize:12,textDecoration:"underline",padding:0,fontFamily:"Lato,sans-serif"}},txt);
+  const bigBtn=(txt,fn,enabled)=>e("button",{onClick:fn,disabled:!enabled,style:{width:"100%",background:enabled?"#d4a017":"#1c1c1c",color:enabled?"#0a0800":"#444",border:enabled?"none":"1px solid #2a2a2a",borderRadius:10,padding:"14px",fontSize:15,fontWeight:700,fontFamily:"'Cinzel',serif",letterSpacing:2}},txt);
+
+  let body;
+  if(mode==="existing"){
+    body=e(React.Fragment,null,
+      note("Already sailing on another device? Pick yer name to carry on where ye left off: gold, streak and all."),
+      checking&&note("Checking the crew roster…","#6aa8d8"),
+      unavailable&&note("Can't reach the crew roster right now. Check yer signal, or sign in anyway with the exact name.","#f0a060"),
+      exact&&e("div",{style:{background:"#0a1a0f",border:"1px solid #1a3a20",borderRadius:14,padding:"14px 16px",marginBottom:14,textAlign:"left"}},
+        e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:15,color:"#6fcf8a",marginBottom:4}},`Welcome back, ${exact}!`),
+        e("div",{style:{color:"#5a9a6a",fontSize:12,lineHeight:1.5}},`${st.gold} gold · ${st.answered} answer${st.answered!==1?"s":""} · ${acc}% accuracy · ${rankTitle}`)),
+      (!exact&&typed&&roster)&&note(`No pirate called "${typed}" yet. Check the spelling, or `+"",null),
+      (!exact&&typed&&roster)&&e("div",{style:{textAlign:"left",marginTop:-8,marginBottom:12}},linkBtn("I'm new here instead",()=>setMode("new"))),
+      exact
+        ?bigBtn(`Sign in as ${exact}`,primary,true)
+        :(unavailable&&typed?bigBtn(`Sign in anyway as ${typed}`,primary,true):null),
+      (!exact&&roster&&chips.length>0)&&e("div",{style:{marginTop:16,textAlign:"left"}},
+        e("div",{style:{color:"#5a4a20",fontSize:10,textTransform:"uppercase",letterSpacing:2.5,marginBottom:8}},"Who's aboard?"),
+        e("div",{style:{display:"flex",flexWrap:"wrap",gap:6}},
+          chips.map(n=>e("button",{key:n,onClick:()=>setName(n),style:{background:"#161616",border:"1px solid #2a2a2a",borderRadius:20,color:"#c8b890",padding:"6px 13px",fontSize:12,fontFamily:"Lato,sans-serif"}},n))))
+    );
+  } else {
+    body=e(React.Fragment,null,
+      note("Pick a pirate name. Yer gold and history will be saved under it."),
+      checking&&note("Checking the crew roster…","#6aa8d8"),
+      unavailable&&note("Can't reach the crew roster, so I can't check whether this name is free. Ye can still set sail.","#f0a060"),
+      exact&&note(`"${exact}" already sails with this crew.`,"#e05555"),
+      exact&&e("div",{style:{textAlign:"left",marginTop:-8,marginBottom:12}},linkBtn("That's me. Sign in instead",()=>setMode("existing"))),
+      reserved&&note("That name is reserved for the ship's own bot.","#e05555"),
+      tooLong&&note("Keep it to 24 characters or fewer, matey.","#e05555"),
+      note("These characters are dropped from names:  . # $ / [ ] |","#444"),
+      bigBtn("Set Sail",primary,!!typed&&!exact&&!reserved&&!tooLong&&!checking)
+    );
+  }
+
   return e("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"radial-gradient(ellipse at 50% 20%,#1c1200,#0a0a0a 65%)",padding:20}},
-    e("div",{style:{background:"#111",border:"1px solid #2a2000",borderRadius:24,padding:"52px 40px 44px",maxWidth:400,width:"100%",textAlign:"center",boxShadow:"0 32px 80px rgba(0,0,0,.7)",animation:"pop .35s ease"}},
-      e("div",{style:{fontSize:52,marginBottom:16}},"⚓"),
-      e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:36,fontWeight:900,color:"#d4a017",letterSpacing:4,lineHeight:1}},"ScAllywag"),
-      e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:13,color:"#6a5a30",letterSpacing:6,textTransform:"uppercase",marginBottom:36,marginTop:4}},"Trivia"),
-      e("input",{style:{width:"100%",background:"#0a0a0a",border:"1px solid #2a2000",borderRadius:10,padding:"14px 18px",color:"#e8dcc8",fontSize:15,fontFamily:"Lato,sans-serif",outline:"none",marginBottom:14,boxSizing:"border-box"},placeholder:"Enter your name to play…",value:nameInput,onChange:ev=>setNameInput(ev.target.value),onKeyDown:ev=>ev.key==="Enter"&&onLogin(),autoFocus:true}),
-      e("button",{onClick:onLogin,style:{width:"100%",background:"#d4a017",color:"#0a0800",border:"none",borderRadius:10,padding:"14px",fontSize:15,fontWeight:700,fontFamily:"'Cinzel',serif",letterSpacing:2}},"Set Sail")
+    e("div",{style:{background:"#111",border:"1px solid #2a2000",borderRadius:24,padding:"40px 30px 32px",maxWidth:400,width:"100%",textAlign:"center",boxShadow:"0 32px 80px rgba(0,0,0,.7)",animation:"pop .35s ease"}},
+      e("div",{style:{fontSize:46,marginBottom:12}},"⚓"),
+      e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:34,fontWeight:900,color:"#d4a017",letterSpacing:4,lineHeight:1}},"ScAllywag"),
+      e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:13,color:"#6a5a30",letterSpacing:6,textTransform:"uppercase",marginBottom:24,marginTop:4}},"Trivia"),
+      e("div",{style:{display:"flex",background:"#0d0d0d",borderRadius:12,padding:4,gap:3,marginBottom:18}},seg("new","I'm new here"),seg("existing","I already sail here")),
+      e("input",{style:{width:"100%",background:"#0a0a0a",border:"1px solid #2a2000",borderRadius:10,padding:"14px 18px",color:"#e8dcc8",fontSize:16,fontFamily:"Lato,sans-serif",outline:"none",marginBottom:14,boxSizing:"border-box"},placeholder:mode==="new"?"Choose a pirate name…":"Type yer name…",value:name,maxLength:40,onChange:ev=>setName(ev.target.value),onKeyDown:ev=>{if(ev.key==="Enter")primary();},autoFocus:true}),
+      body
     )
   );
 }
@@ -2244,18 +2722,71 @@ function AppHeader({username,setScreen,noticeCount}){
   );
 }
 
+function RenameBusy({text}){
+  const e=React.createElement;
+  return e("div",{style:{position:"fixed",inset:0,zIndex:2000,background:"rgba(5,5,5,.94)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",textAlign:"center",padding:30}},
+    e("div",{style:{width:42,height:42,border:"3px solid #222",borderTop:"3px solid #d4a017",borderRadius:"50%",animation:"spin .8s linear infinite",marginBottom:20}}),
+    e("p",{style:{fontFamily:"'Cinzel',serif",fontSize:16,color:"#d4a017",letterSpacing:1,marginBottom:8}},text),
+    e("p",{style:{color:"#555",fontSize:12,lineHeight:1.6,maxWidth:280}},"Hold fast, matey. Don't close the app until this finishes.")
+  );
+}
+
+function RenameSheet({current,onSubmit,onClose}){
+  const e=React.createElement;
+  const [val,setVal]=useState(current);
+  const [err,setErr]=useState("");
+  const [working,setWorking]=useState(false);
+  const clean=cleanName(val);
+  const submit=async()=>{
+    if(working) return;
+    setErr(""); setWorking(true);
+    const msg=await onSubmit(val);
+    setWorking(false);
+    if(msg) setErr(msg);
+  };
+  const can=!!clean&&clean!==current&&!working;
+  return e("div",{style:{position:"fixed",inset:0,zIndex:1500,background:"rgba(0,0,0,.8)",display:"flex",alignItems:"center",justifyContent:"center",padding:20},onClick:onClose},
+    e("div",{onClick:ev=>ev.stopPropagation(),style:{background:"#111",border:"1px solid #3a2a00",borderRadius:20,padding:"26px 22px",maxWidth:380,width:"100%",boxShadow:"0 30px 80px rgba(0,0,0,.8)",animation:"pop .25s ease"}},
+      e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:18,color:"#d4a017",marginBottom:6}},"Change yer name"),
+      e("p",{style:{color:"#7a7a7a",fontSize:12,lineHeight:1.6,marginBottom:16}},"Yer gold, streak, answers, questions and plank record all sail with ye. Nothing is lost."),
+      e("input",{autoFocus:true,value:val,maxLength:24,placeholder:"New pirate name…",
+        onChange:ev=>{setVal(ev.target.value);setErr("");},
+        onKeyDown:ev=>{if(ev.key==="Enter"&&can)submit();},
+        style:{width:"100%",background:"#0a0a0a",border:"1px solid #2a2000",borderRadius:10,padding:"13px 16px",color:"#e8dcc8",fontSize:16,fontFamily:"Lato,sans-serif",outline:"none",marginBottom:10,boxSizing:"border-box"}}),
+      err&&e("p",{style:{color:"#e05555",fontSize:12,marginBottom:10,lineHeight:1.5}},err),
+      e("p",{style:{color:"#444",fontSize:11,marginBottom:18,lineHeight:1.5}},"Up to 24 characters. These are dropped: . # $ / [ ] |  ·  Needs a signal, and the name can't already belong to another pirate."),
+      e("div",{style:{display:"flex",gap:10}},
+        e("button",{onClick:onClose,style:{flex:1,background:"#161616",border:"1px solid #2a2a2a",borderRadius:10,color:"#888",padding:"12px",fontSize:14}},"Cancel"),
+        e("button",{onClick:submit,disabled:!can,style:{flex:1.4,background:can?"#d4a017":"#1c1c1c",border:can?"none":"1px solid #2a2a2a",borderRadius:10,color:can?"#0a0800":"#444",padding:"12px",fontSize:14,fontWeight:700,fontFamily:"'Cinzel',serif",letterSpacing:1}},working?"Checking…":"Change Name")
+      )
+    )
+  );
+}
+
+function SyncBanner({pending,onRetry}){
+  const e=React.createElement;
+  return e("div",{style:{background:"#0f1620",borderBottom:"1px solid #1a3550",padding:"8px 20px",display:"flex",alignItems:"center",gap:10}},
+    e("span",{style:{fontSize:14}},"⏳"),
+    e("p",{style:{flex:1,color:"#6aa8d8",fontSize:12,lineHeight:1.4}},`${pending} update${pending!==1?"s":""} saved on this device — will sync on its own when there's a signal.`),
+    e("button",{onClick:onRetry,style:{background:"none",border:"1px solid #1a3550",borderRadius:14,color:"#6aa8d8",padding:"4px 12px",fontSize:11,flexShrink:0}},"Retry now")
+  );
+}
+
 function NoticeBanner({notices,onDismiss}){
   const e=React.createElement;
+  const icon=n=>n.kind==="credit"?"✅":n.kind==="appeal"?"⚖️":"⚠️";
   return e("div",{style:{background:"#1a0a00",borderBottom:"1px solid #5a2500",padding:"12px 20px",animation:"slideDown .3s ease"}},
-    notices.map(n=>e("div",{key:n.qid,style:{display:"flex",alignItems:"flex-start",gap:12,marginBottom:notices.length>1?10:0}},
-      e("span",{style:{fontSize:18,flexShrink:0,marginTop:1}},"⚠️"),
-      e("p",{style:{flex:1,color:"#f0a060",fontSize:13,lineHeight:1.5}},`A question you answered (`,e("strong",null,`"${n.subject}"`),`) was flagged and pulled by the crew. Ye've been granted `,e("strong",null,"+1 bonus question"),` for yer next voyage!`),
-      e("button",{onClick:()=>onDismiss(n.qid),style:{background:"none",border:"none",color:"#5a2500",fontSize:18,padding:0,flexShrink:0,lineHeight:1,cursor:"pointer"}},"✕")
+    notices.map(n=>e("div",{key:n.id||n.qid,style:{display:"flex",alignItems:"flex-start",gap:12,marginBottom:notices.length>1?10:0}},
+      e("span",{style:{fontSize:18,flexShrink:0,marginTop:1}},icon(n)),
+      n.text
+        ?e("p",{style:{flex:1,color:n.kind==="credit"?"#8fd69c":"#f0a060",fontSize:13,lineHeight:1.5}},n.text)
+        :e("p",{style:{flex:1,color:"#f0a060",fontSize:13,lineHeight:1.5}},"A question you answered (",e("strong",null,`"${n.subject}"`),") was flagged and pulled by the crew. Ye've been granted ",e("strong",null,"+1 bonus question")," for yer next voyage!"),
+      e("button",{onClick:()=>onDismiss(n.id||n.qid),style:{background:"none",border:"none",color:"#5a2500",fontSize:18,padding:0,flexShrink:0,lineHeight:1,cursor:"pointer"}},"✕")
     ))
   );
 }
 
-function BottomNav({screen,setScreen,dailyAnsweredCount,effectiveLimit,noticeCount}){
+function BottomNav({screen,setScreen,dailyAnsweredCount,effectiveLimit,noticeCount,appealBadge}){
   const e=React.createElement;
   const tabs=[{id:"home",icon:"🏠",label:"Home"},{id:"play",icon:"🎯",label:"Play"},{id:"submit",icon:"✏️",label:"Submit"},{id:"leaderboard",icon:"🏆",label:"Board"},{id:"profile",icon:"🏴‍☠️",label:"Profile"}];
   return e("nav",{style:{position:"fixed",bottom:0,left:0,right:0,height:"calc(68px + env(safe-area-inset-bottom, 0px))",background:"#0a0a0a",borderTop:"1px solid #1c1c1c",display:"flex",zIndex:200}},
@@ -2263,12 +2794,14 @@ function BottomNav({screen,setScreen,dailyAnsweredCount,effectiveLimit,noticeCou
       const active=screen===t.id||(t.id==="profile"&&screen==="settings");
       const playBadge=t.id==="play"&&dailyAnsweredCount<effectiveLimit;
       const settingsBadge=t.id==="profile"&&noticeCount>0;
+      const submitBadge=t.id==="submit"&&appealBadge>0;
       return e("button",{key:t.id,onClick:()=>setScreen(t.id),style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3,background:"none",border:"none",color:active?"#d4a017":"#444",fontFamily:"Lato,sans-serif",fontSize:11,letterSpacing:.5,padding:"8px 0 6px",position:"relative"}},
         active&&e("div",{style:{position:"absolute",top:0,left:"50%",transform:"translateX(-50%)",width:32,height:2,background:"#d4a017",borderRadius:"0 0 3px 3px"}}),
         e("span",{style:{fontSize:20,lineHeight:1,position:"relative"}},
           t.icon,
           playBadge&&e("span",{style:{position:"absolute",top:-4,right:-8,background:"#d4a017",color:"#0a0800",borderRadius:10,fontSize:9,fontWeight:700,padding:"1px 5px",lineHeight:1.4}},effectiveLimit-dailyAnsweredCount),
-          settingsBadge&&e("span",{style:{position:"absolute",top:-4,right:-8,background:"#e05555",color:"#fff",borderRadius:10,fontSize:9,fontWeight:700,padding:"1px 5px",lineHeight:1.4}},noticeCount)
+          settingsBadge&&e("span",{style:{position:"absolute",top:-4,right:-8,background:"#e05555",color:"#fff",borderRadius:10,fontSize:9,fontWeight:700,padding:"1px 5px",lineHeight:1.4}},noticeCount),
+          submitBadge&&e("span",{style:{position:"absolute",top:-4,right:-8,background:"#d4a017",color:"#0a0800",borderRadius:10,fontSize:9,fontWeight:700,padding:"1px 5px",lineHeight:1.4}},appealBadge)
         ),
         e("span",{style:{fontWeight:active?700:400}},t.label)
       );
@@ -2335,7 +2868,7 @@ function HomeScreen({username,questions,scores,dailyAnsweredCount,effectiveLimit
   );
 }
 
-function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCount,effectiveLimit,flags,pulledIds,onCorrect,onWrong,onFlag}){
+function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCount,effectiveLimit,flags,pulledIds,onCorrect,onWrong,onFlag,onAppeal}){
   const [currentQ,setCurrentQ]=useState(null);
   const [revealed,setRevealed]=useState(false);
   const [answerInput,setAnswerInput]=useState("");
@@ -2344,6 +2877,7 @@ function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCo
   const [showParticles,setShowParticles]=useState(false);
   const [localCount,setLocalCount]=useState(dailyAnsweredCount);
   const [flagged,setFlagged]=useState(false);
+  const [appealed,setAppealed]=useState(false);
   const [showFlagConfirm,setShowFlagConfirm]=useState(false);
   const e=React.createElement;
 
@@ -2363,14 +2897,14 @@ function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCo
     const slot=todayA.length;
     if(slot>=effectiveLimit){setCurrentQ(null);return;}
     setCurrentQ(getQ(slot,log||dailyLog));
-    setRevealed(false);setAnswerInput("");setResult(null);setResultMsg(null);setShowParticles(false);setFlagged(false);setShowFlagConfirm(false);
+    setRevealed(false);setAnswerInput("");setResult(null);setResultMsg(null);setShowParticles(false);setFlagged(false);setAppealed(false);setShowFlagConfirm(false);
   },[dailyLog,getQ,username,effectiveLimit]);
 
   useEffect(()=>{loadNext(dailyLog);},[]);
 
   const handleAnswer=async()=>{
     if(!answerInput.trim()||result||!currentQ) return;
-    const correct=checkAnswer(answerInput, currentQ.answer);
+    const correct=checkAnswerFor(answerInput, currentQ);
     const lines=correct?TREASURE_LINES:LOOT_LOST_LINES;
     setResult(correct?"correct":"wrong");
     setResultMsg(lines[Math.floor(Math.random()*lines.length)]);
@@ -2382,6 +2916,7 @@ function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCo
   };
 
   const handleNext=()=>{loadNext(currentQ?._updatedLog||dailyLog);};
+  const handleAppeal=()=>{if(!currentQ||appealed)return;setAppealed(true);onAppeal(currentQ.id,answerInput.trim());};
   const handleFlag=async()=>{if(!currentQ||flagged)return;setFlagged(true);setShowFlagConfirm(false);onFlag(currentQ.id,username);};
 
   if(localCount>=effectiveLimit&&!result) return e(DoneForToday,{effectiveLimit});
@@ -2404,6 +2939,11 @@ function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCo
       isWrong&&e("div",{style:{background:"rgba(255,255,255,.05)",border:"1px solid #2a1010",borderRadius:12,padding:"14px 24px",marginBottom:16,maxWidth:340}},
         e("p",{style:{color:"#666",fontSize:12,textTransform:"uppercase",letterSpacing:2,marginBottom:6}},"The answer was"),
         e("p",{style:{color:"#e8dcc8",fontFamily:"'Cinzel',serif",fontSize:18,fontWeight:700}},currentQ.answer)
+      ),
+      isWrong&&e("div",{style:{marginBottom:14,maxWidth:340}},
+        appealed
+          ?e("p",{style:{color:"#8aa86a",fontSize:12,lineHeight:1.5}},"⚖️ Appeal sent! If it's accepted, yer gold arrives automatically.")
+          :e("button",{onClick:handleAppeal,style:{background:"rgba(212,160,23,.1)",border:"1px solid #5a4000",borderRadius:20,color:"#d4a017",padding:"8px 20px",fontSize:13,fontWeight:700}},"⚖️ I was right — appeal!")
       ),
       isWrong&&!flagged&&!(flags[currentQ.id]||[]).includes(username)&&e("div",{style:{marginBottom:16}},
         !showFlagConfirm
@@ -2454,18 +2994,20 @@ function PlayScreen({username,questions,answered,dailyQ,dailyLog,dailyAnsweredCo
   );
 }
 
-function SubmitScreen({username,questions,answered,attempts,onSubmit}){
+function SubmitScreen({username,questions,answered,attempts,onSubmit,appeals,onAccept,onDecline}){
   const [subject,setSubject]=useState("");
   const [question,setQuestion]=useState("");
   const [answer,setAnswer]=useState("");
   const [crewNote,setCrewNote]=useState("");
+  const [alts,setAlts]=useState("");
   const [error,setError]=useState("");
   const [expandedId,setExpandedId]=useState(null);
   const e=React.createElement;
   const myQs=questions.filter(q=>q.author===username).slice().reverse();
   const handle=()=>{
     if(!subject.trim()||!question.trim()||!answer.trim()){setError("All fields are required.");return;}
-    onSubmit({subject:subject.trim(),question:question.trim(),answer:normalize(answer),crewNote:crewNote.trim()});
+    const altList=alts.split(/[,;\n]/).map(s=>s.trim().toLowerCase()).filter(Boolean);
+    onSubmit({subject:subject.trim(),question:question.trim(),answer:answer.trim(),crewNote:crewNote.trim(),...(altList.length?{alts:altList}:{})});
   };
   const fs={width:"100%",background:"#0d0d0d",border:"1px solid #222",borderRadius:10,padding:"13px 16px",color:"#e8dcc8",fontSize:15,fontFamily:"Lato,sans-serif",outline:"none",marginBottom:20,boxSizing:"border-box"};
   const ls={display:"block",color:"#5a4a20",fontSize:11,textTransform:"uppercase",letterSpacing:2.5,marginBottom:8};
@@ -2482,6 +3024,9 @@ function SubmitScreen({username,questions,answered,attempts,onSubmit}){
       e("textarea",{style:{...fs,minHeight:90},placeholder:"Ask something tricky…",value:question,onChange:ev=>setQuestion(ev.target.value)}),
       e("label",{style:ls},"The Answer"),
       e("input",{style:{...fs,marginBottom:16},placeholder:"Exact answer (case-insensitive)",value:answer,onChange:ev=>setAnswer(ev.target.value)}),
+      e("label",{style:ls},"Also Accept (optional)"),
+      e("input",{style:{...fs,marginBottom:6},placeholder:"Other correct answers, separated by commas",value:alts,onChange:ev=>setAlts(ev.target.value)}),
+      e("p",{style:{color:"#4a4a4a",fontSize:11,marginBottom:16,lineHeight:1.5}},"e.g. for Netherlands: holland. Typos, “the”, and numbers vs. spelled-out numbers are already handled for ye."),
       e("label",{style:ls},"Crew Note (optional)"),
       e("div",{style:{background:"#0a0f0a",border:"1px solid #1a2a1a",borderRadius:8,padding:"8px 12px",marginBottom:8}},
         e("p",{style:{color:"#4a7a4a",fontSize:11}},"⚓ Add a note if yer crew needs guidance answering — e.g. 'Full name required, matey!' or 'Last name only, ye scallywag!'")
@@ -2497,11 +3042,13 @@ function SubmitScreen({username,questions,answered,attempts,onSubmit}){
           const qa=attempts[q.id]||[],correct=qa.filter(a=>a.correct).length,total=qa.length,pct=total>0?Math.round((correct/total)*100):null,isOpen=expandedId===q.id;
           const wrongMap={};qa.filter(a=>!a.correct).forEach(a=>{const k=a.answer.toLowerCase();if(!wrongMap[k])wrongMap[k]={text:a.answer,count:0,users:[]};wrongMap[k].count++;if(!wrongMap[k].users.includes(a.user))wrongMap[k].users.push(a.user);});
           const topWrong=Object.values(wrongMap).sort((a,b)=>b.count-a.count).slice(0,5);
+          const qAppeals=(appeals||[]).filter(a=>a.qid===q.id&&a.status==="open");
           return e("div",{key:q.id,style:{marginBottom:10}},
             e("button",{onClick:()=>setExpandedId(isOpen?null:q.id),style:{width:"100%",background:"#141414",border:"1px solid #1e1e1e",borderRadius:isOpen?"14px 14px 0 0":"14px",padding:"14px 16px",display:"flex",alignItems:"center",gap:10,cursor:"pointer",textAlign:"left"}},
               e("span",{style:{background:"#1a1400",border:"1px solid #2e2200",color:"#d4a017",borderRadius:20,padding:"3px 12px",fontSize:12,whiteSpace:"nowrap",flexShrink:0}},q.subject),
               e("span",{style:{color:"#888",fontSize:13,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},q.question),
               pct!==null&&e("span",{style:{fontFamily:"'Cinzel',serif",fontSize:13,color:pct>=70?"#2ecc71":pct>=40?"#d4a017":"#e74c3c",fontWeight:700,flexShrink:0}},`${pct}%`),
+              qAppeals.length>0&&e("span",{style:{color:"#d4a017",fontSize:12,flexShrink:0}},`⚖️ ${qAppeals.length}`),
               e("span",{style:{color:"#444",fontSize:12,flexShrink:0}},`${total} play${total!==1?"s":""}`),
               e("span",{style:{color:"#555",fontSize:16,transition:"transform .2s",display:"inline-block",transform:isOpen?"rotate(180deg)":"none"}},"▾")
             ),
@@ -2530,12 +3077,23 @@ function SubmitScreen({username,questions,answered,attempts,onSubmit}){
                         qa.filter(a=>a.correct).map((a,i)=>e("span",{key:i,style:{background:"#0d2010",border:"1px solid #1a4020",color:"#6fcf8a",borderRadius:20,padding:"3px 12px",fontSize:12}},a.user))
                       )
                     ),
+                    qAppeals.length>0&&e(React.Fragment,null,
+                      e("p",{style:{color:"#d4a017",fontSize:11,textTransform:"uppercase",letterSpacing:2,marginBottom:8}},"⚖️ Appeals to review"),
+                      qAppeals.map(ap=>e("div",{key:ap.id,style:{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:"#1a1400",border:"1px solid #3a2a00",borderRadius:10,marginBottom:6,flexWrap:"wrap"}},
+                        e("span",{style:{color:"#e8dcc8",fontSize:13,flex:1,minWidth:120}},`"${ap.answer}" `,e("span",{style:{color:"#6a5a30",fontSize:11}},`— ${ap.user}`)),
+                        e("button",{onClick:()=>onAccept(q.id,ap.answer),style:{background:"#0d2010",border:"1px solid #1a4020",color:"#6fcf8a",borderRadius:14,padding:"4px 12px",fontSize:12,fontWeight:700}},"✅ Accept"),
+                        e("button",{onClick:()=>onDecline(ap.id),style:{background:"none",border:"1px solid #3a1515",color:"#8a5050",borderRadius:14,padding:"4px 12px",fontSize:12}},"Decline")
+                      )),
+                      e("div",{style:{height:10}})
+                    ),
                     topWrong.length>0&&e(React.Fragment,null,
-                      e("p",{style:{color:"#5a4a20",fontSize:11,textTransform:"uppercase",letterSpacing:2,marginBottom:8}},"Common Wrong Answers"),
+                      e("p",{style:{color:"#5a4a20",fontSize:11,textTransform:"uppercase",letterSpacing:2,marginBottom:4}},"Common Wrong Answers"),
+                      e("p",{style:{color:"#4a4a4a",fontSize:11,marginBottom:8,lineHeight:1.4}},"Should one of these have counted? Tap Accept and everyone who gave it gets their points."),
                       topWrong.map((w,i)=>e("div",{key:i,style:{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",background:"rgba(231,76,60,.05)",border:"1px solid rgba(231,76,60,.12)",borderRadius:9,marginBottom:6}},
                         e("span",null,"❌"),
                         e("span",{style:{color:"#c08080",fontSize:14,flex:1,fontStyle:"italic"}},`"${w.text}"`),
                         e("span",{style:{color:"#666",fontSize:12}},`${w.count}×`),
+                         e("button",{onClick:()=>onAccept(q.id,w.text),style:{background:"#0d2010",border:"1px solid #1a4020",color:"#6fcf8a",borderRadius:14,padding:"3px 10px",fontSize:11,fontWeight:700,flexShrink:0}},"✅ Accept"),
                         e("div",{style:{display:"flex",flexWrap:"wrap",gap:4}},w.users.map((u,j)=>e("span",{key:j,style:{background:"#1a0e0e",border:"1px solid #3a1515",color:"#8a5050",borderRadius:20,padding:"2px 8px",fontSize:11}},u)))
                       ))
                     ),
@@ -2658,7 +3216,7 @@ function dayStreak(dailyLog, username) {
   return streak;
 }
 
-function ProfileScreen({username,questions,attempts,scores,dailyLog,plankHistory,onOpenSettings}){
+function ProfileScreen({username,questions,attempts,scores,dailyLog,plankHistory,onOpenSettings,isCaptain,openAppeals,onAccept,onDecline,onRename}){
   const e = React.createElement;
 
   // Tally this player's answers by category
@@ -2717,7 +3275,10 @@ function ProfileScreen({username,questions,attempts,scores,dailyLog,plankHistory
           e("div",{style:{position:"absolute",inset:10,borderRadius:"50%",background:"#0a0a0a",border:"1px solid #2a2000",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Cinzel',serif",fontSize:26,fontWeight:900,color:"#d4a017"}},username[0].toUpperCase())
         ),
         e("div",{style:{flex:1,minWidth:0}},
-          e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:21,fontWeight:700,color:"#e8dcc8",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},username),
+          e("div",{style:{display:"flex",alignItems:"center",gap:8,minWidth:0}},
+            e("div",{style:{fontFamily:"'Cinzel',serif",fontSize:21,fontWeight:700,color:"#e8dcc8",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",minWidth:0}},username),
+            onRename&&e("button",{onClick:onRename,"aria-label":"Change name",title:"Change name",style:{background:"#161616",border:"1px solid #2a2a2a",borderRadius:14,color:"#8a7040",padding:"3px 9px",fontSize:12,flexShrink:0}},"✏️")
+          ),
           e("div",{style:{display:"inline-flex",alignItems:"center",gap:6,marginTop:6,background:"#1a1400",border:"1px solid #3a2a00",borderRadius:20,padding:"3px 12px"}},
             e("span",{style:{fontSize:14}},rank.icon),
             e("span",{style:{fontFamily:"'Cinzel',serif",fontSize:12,color:"#d4a017",letterSpacing:1}},rank.title)
@@ -2734,6 +3295,22 @@ function ProfileScreen({username,questions,attempts,scores,dailyLog,plankHistory
           e("div",{style:{height:"100%",width:`${rankPct}%`,background:"linear-gradient(90deg,#b8820f,#f5c842)",borderRadius:20,transition:"width .8s ease"}})
         )
       )
+    ),
+
+    // Captain's review: every open appeal (captains only)
+    (isCaptain&&openAppeals&&openAppeals.length>0)&&e("div",{style:{...card,padding:"16px",marginBottom:14,border:"1px solid #3a2a00",background:"#14110a"}},
+      e("div",{style:{...label,color:"#d4a017",marginBottom:6}},`⚖️ Captain's Review (${openAppeals.length})`),
+      openAppeals.map(ap=>{
+        const q=(questions||[]).find(x=>x.id===ap.qid);
+        return e("div",{key:ap.id,style:{padding:"10px 0",borderTop:"1px solid #221b08"}},
+          e("p",{style:{color:"#e8dcc8",fontSize:13,lineHeight:1.4,marginBottom:4}},q?q.question:"(question removed)"),
+          e("p",{style:{color:"#7a6a40",fontSize:11,marginBottom:8,lineHeight:1.4}},`Correct answer: ${q?q.answer:"?"}  ·  ${ap.user} answered: "${ap.answer}"`),
+          e("div",{style:{display:"flex",gap:8}},
+            e("button",{onClick:()=>onAccept(ap.qid,ap.answer),style:{background:"#0d2010",border:"1px solid #1a4020",color:"#6fcf8a",borderRadius:14,padding:"5px 14px",fontSize:12,fontWeight:700}},"✅ Accept"),
+            e("button",{onClick:()=>onDecline(ap.id),style:{background:"none",border:"1px solid #3a1515",color:"#8a5050",borderRadius:14,padding:"5px 14px",fontSize:12}},"Decline")
+          )
+        );
+      })
     ),
 
     // Stat tiles
@@ -2793,16 +3370,17 @@ function ProfileScreen({username,questions,attempts,scores,dailyLog,plankHistory
   );
 }
 
-function SettingsScreen({onBack,username,userNotices,notificationsEnabled,setNotificationsEnabled,forceSyncToFirebase,onSaveName,onDismissNotice}){
+function SettingsScreen({onBack,username,userNotices,notificationsEnabled,setNotificationsEnabled,forceSyncToFirebase,onRename,onSignOut,onDismissNotice}){
   const [nameInput,setNameInput]=useState(username);
   const [changed,setChanged]=useState(false);
   const [error,setError]=useState("");
+  const [confirmOut,setConfirmOut]=useState(false);
   const [syncStatus,setSyncStatus]=useState(null); // null | "syncing" | "ok" | "fail"
   const e=React.createElement;
   const handleSave=()=>{
     if(!nameInput.trim()){setError("Name can't be empty, matey!");return;}
     if(nameInput.trim()===username){setError("That's already yer name!");return;}
-    onSaveName(nameInput.trim());
+    (onRename&&onRename());
   };
   return e("div",{style:{maxWidth:480,margin:"0 auto",padding:"36px 24px 32px"}},
     onBack&&e("button",{onClick:onBack,style:{background:"none",border:"none",color:"#8a7040",fontSize:13,padding:"0 0 14px",fontFamily:"Lato,sans-serif"}},"← Back to Profile"),
@@ -2810,13 +3388,17 @@ function SettingsScreen({onBack,username,userNotices,notificationsEnabled,setNot
     e("p",{style:{color:"#555",fontSize:13,marginBottom:28}},"Manage yer pirate identity"),
     userNotices.length>0&&e("div",{style:{marginBottom:24}},
       e("p",{style:{color:"#5a4a20",fontSize:11,textTransform:"uppercase",letterSpacing:2.5,marginBottom:10}},"Crew Notices"),
-      userNotices.map(n=>e("div",{key:n.qid,style:{background:"#1a0a00",border:"1px solid #5a2500",borderRadius:12,padding:"14px 16px",marginBottom:8,display:"flex",gap:12,alignItems:"flex-start"}},
+      userNotices.map(n=>e("div",{key:n.id||n.qid,style:{background:"#1a0a00",border:"1px solid #5a2500",borderRadius:12,padding:"14px 16px",marginBottom:8,display:"flex",gap:12,alignItems:"flex-start"}},
         e("span",{style:{fontSize:18,flexShrink:0}},"⚠️"),
         e("div",{style:{flex:1}},
-          e("p",{style:{color:"#f0a060",fontSize:13,lineHeight:1.5,marginBottom:4}},"A question you answered in ",e("strong",null,`"${n.subject}"`),` was pulled by the crew.`),
-          e("p",{style:{color:"#7a5030",fontSize:12}},"+1 bonus question has been added to yer next voyage.")
+          n.text
+            ?e("p",{style:{color:n.kind==="credit"?"#8fd69c":"#f0a060",fontSize:13,lineHeight:1.5}},n.text)
+            :e(React.Fragment,null,
+              e("p",{style:{color:"#f0a060",fontSize:13,lineHeight:1.5,marginBottom:4}},"A question you answered in ",e("strong",null,`"${n.subject}"`),` was pulled by the crew.`),
+              e("p",{style:{color:"#7a5030",fontSize:12}},"+1 bonus question has been added to yer next voyage.")
+            )
         ),
-        e("button",{onClick:()=>onDismissNotice(n.qid),style:{background:"none",border:"none",color:"#5a2500",fontSize:16,padding:0,flexShrink:0,cursor:"pointer"}},"✕")
+        e("button",{onClick:()=>onDismissNotice(n.id||n.qid),style:{background:"none",border:"none",color:"#5a2500",fontSize:16,padding:0,flexShrink:0,cursor:"pointer"}},"✕")
       ))
     ),
     e("div",{style:{background:"#121212",border:"1px solid #1e1e1e",borderRadius:16,padding:"28px 24px",marginBottom:20}},
@@ -2827,10 +3409,8 @@ function SettingsScreen({onBack,username,userNotices,notificationsEnabled,setNot
           e("div",{style:{color:"#555",fontSize:12,marginTop:2}},"Current pirate name")
         )
       ),
-      e("label",{style:{display:"block",color:"#5a4a20",fontSize:11,textTransform:"uppercase",letterSpacing:2.5,marginBottom:8}},"Change Name"),
-      e("input",{style:{width:"100%",background:"#0d0d0d",border:"1px solid #222",borderRadius:10,padding:"13px 16px",color:"#e8dcc8",fontSize:15,fontFamily:"Lato,sans-serif",outline:"none",marginBottom:error?8:16,boxSizing:"border-box"},value:nameInput,onChange:ev=>{setNameInput(ev.target.value);setChanged(ev.target.value.trim()!==username);setError("");},onKeyDown:ev=>ev.key==="Enter"&&handleSave(),placeholder:"Enter new name…"}),
-      error&&e("p",{style:{color:"#e05555",fontSize:13,marginBottom:14}},error),
-      e("button",{onClick:handleSave,disabled:!changed||!nameInput.trim(),style:{width:"100%",background:changed&&nameInput.trim()?"#d4a017":"#1c1c1c",color:changed&&nameInput.trim()?"#0a0800":"#444",border:changed&&nameInput.trim()?"none":"1px solid #2a2a2a",borderRadius:10,padding:"13px",fontSize:14,fontWeight:700,fontFamily:"'Cinzel',serif",letterSpacing:1,transition:"all .2s"}},"Save New Name")
+      e("button",{onClick:onRename,style:{width:"100%",background:"#1a1400",border:"1px solid #3a2a00",borderRadius:10,padding:"13px",fontSize:14,fontWeight:700,fontFamily:"'Cinzel',serif",letterSpacing:1,color:"#d4a017"}},"✏️  Change My Name"),
+      e("p",{style:{color:"#555",fontSize:12,lineHeight:1.6,marginTop:12}},"Yer gold, streak, answers, questions and plank record all sail with ye. Nothing is lost.")
     ),
     e("div",{style:{background:"#121212",border:"1px solid #1e1e1e",borderRadius:16,padding:"24px",marginBottom:20}},
       e("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}},
@@ -2890,8 +3470,17 @@ function SettingsScreen({onBack,username,userNotices,notificationsEnabled,setNot
       ),
       e("p",{style:{color:"#444",fontSize:12,borderTop:"1px solid #1a1a1a",paddingTop:10}},"Use this if yer scores or answers aren't showing up for the crew. It merges yer local data with Firebase.")
     ),
+    e("div",{style:{background:"#121212",border:"1px solid #1e1e1e",borderRadius:16,padding:"22px 24px",marginBottom:20}},
+      e("p",{style:{fontFamily:"'Cinzel',serif",fontSize:15,color:"#e8dcc8",marginBottom:4}},"🧭 Switch Pirate / Sign Out"),
+      e("p",{style:{color:"#555",fontSize:12,lineHeight:1.6,marginBottom:14}},`Signed in as ${username}. Signing out keeps all yer gold and history safe in the cloud. Sign back in any time, on any device, with yer name.`),
+      confirmOut
+        ?e("div",{style:{display:"flex",gap:8}},
+            e("button",{onClick:()=>onSignOut&&onSignOut(),style:{flex:1,background:"#2a0d0d",border:"1px solid #6a1a1a",borderRadius:10,color:"#e05555",padding:"11px",fontSize:13,fontWeight:700}},"Yes, sign out"),
+            e("button",{onClick:()=>setConfirmOut(false),style:{flex:1,background:"#161616",border:"1px solid #2a2a2a",borderRadius:10,color:"#888",padding:"11px",fontSize:13}},"Stay aboard"))
+        :e("button",{onClick:()=>setConfirmOut(true),style:{width:"100%",background:"#161616",border:"1px solid #2a2a2a",borderRadius:10,color:"#aaa",padding:"12px",fontSize:13}},"Sign Out")
+    ),
     e("div",{style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:14,padding:"18px 20px"}},
-      e("p",{style:{color:"#3a3a3a",fontSize:12,lineHeight:1.6}},"⚓  Yer name is saved to this device. Changing it won't affect yer score history — scores are tied to yer previous name.")
+      e("p",{style:{color:"#3a3a3a",fontSize:12,lineHeight:1.6}},"⚓  Change yer name any time — yer whole history moves with ye.")
     )
   );
 }

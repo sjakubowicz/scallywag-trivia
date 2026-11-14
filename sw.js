@@ -1,4 +1,4 @@
-const VERSION = "v1.0.4";
+const VERSION = "v1.0.7";
 const CACHE   = "scallywag-" + VERSION;
 
 self.addEventListener("install", e => {
